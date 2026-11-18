@@ -1,0 +1,6 @@
+# 工作区产物
+.code-scan/
+out/
+node_modules/
+.DS_Store
+Thumbs.db

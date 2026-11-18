@@ -1,0 +1,15 @@
+{
+  "name": "dev-code-scan",
+  "plugins": [
+    {
+      "name": "code-scan",
+      "source": "./code-scan",
+      "version": "0.1.0",
+      "description": "跨仓库全库扫描:质量、冗余、性能三维度,Devin Agentic MapReduce 复刻",
+      "displayName": "Code Scan",
+      "displayName_i18n": { "zh-CN": "跨仓库全库扫描" },
+      "description_i18n": { "zh-CN": "跨多个仓库做质量/冗余/性能扫描,产出带证据与复核的发现清单" },
+      "category": "developer-tools"
+    }
+  ]
+}

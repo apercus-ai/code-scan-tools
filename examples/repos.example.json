@@ -1,0 +1,11 @@
+[
+  {
+    "name": "team-app",
+    "url": "git@github.com:ORG/team-app.git",
+    "ref": "main"
+  },
+  {
+    "name": "team-lib",
+    "url": "git@github.com:ORG/team-lib.git"
+  }
+]
