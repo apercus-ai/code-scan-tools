@@ -22,14 +22,16 @@ description: 跨仓库全库扫描(质量/冗余/性能),Devin Agentic MapReduce
 3. 解析用户参数:
    - `repos`:JSON 数组,元素为 `{ "name": "...", "url": "...", "ref": "..." }`,或 `{ "name": "...", "path": "工作区内相对路径" }`;也可直接给 `"owner/repo"` 字符串(按 https URL 处理)。用户没给就用当前工作区。
    - `model`:若用户指定了模型,**先调用 `ListModels` 解析为可用的 `providerId/modelId`**,在 `CreateWorkflow` 时作为 `subagent_model` 传入;未指定则省略该参数(用会话默认模型)。
+   - `concurrency`:若用户指定并发上限(如 `concurrency=4`),作为 `max_concurrency` 传入——**这是唯一正确的限流方式**,用户没要求就不要传(运行时自适应);不要用批次上限来限流。
    - `goal`:字符串,原样传入。
 4. 调用 `CreateWorkflow`:
    ```
    CreateWorkflow({
      name: "跨仓库全库扫描",
      path: "<插件目录>/scripts/code-scan.ts",
-     args: { repos: [...], goal: "...", maxFilesPerShard: 12, maxShardsPerRepo: 4 },
-     subagent_model: "<解析后的模型 id>"   // 仅当用户指定时
+     args: { repos: [...], goal: "...", maxFilesPerBatch: 8, maxTotalBatches: 0 },
+     subagent_model: "<解析后的模型 id>",   // 仅当用户指定时
+     max_concurrency: 4                     // 仅当用户指定并发时
    })
    ```
    用户确认后运行在后台;不要轮询,等完成通知。

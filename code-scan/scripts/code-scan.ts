@@ -11,9 +11,10 @@ args:
   - name: maxFilesPerBatch
     type: number
     default: 8
-  - name: maxBatchesPerRepo
+  - name: maxTotalBatches
     type: number
-    default: 4
+    default: 0
+    description: 全局批次数上限;0 表示不限制(推荐),并发由 CreateWorkflow 的 max_concurrency 控制
 */
 
 interface RepoSpec {
@@ -263,17 +264,17 @@ function groupByPath(items: MatchItem[]): PathGroup[] {
   return groups;
 }
 
-function packBatches(groups: PathGroup[], maxFiles: number, maxBatches: number): { batches: PathGroup[][]; overflow: PathGroup[] } {
+function packBatches(groups: PathGroup[], maxFiles: number): PathGroup[][] {
   const all: PathGroup[][] = [];
   for (let i = 0; i < groups.length; i += maxFiles) {
     all.push(groups.slice(i, i + maxFiles));
   }
-  return { batches: all.slice(0, maxBatches), overflow: groups.slice(maxFiles * maxBatches) };
+  return all;
 }
 
 const goal = typeof args.goal === "string" ? args.goal : "全面扫描:质量 / 冗余 / 性能";
 const maxFilesPerBatch = typeof args.maxFilesPerBatch === "number" ? Math.max(3, Math.min(20, args.maxFilesPerBatch)) : 8;
-const maxBatchesPerRepo = typeof args.maxBatchesPerRepo === "number" ? Math.max(1, Math.min(8, args.maxBatchesPerRepo)) : 4;
+const maxTotalBatches = typeof args.maxTotalBatches === "number" ? Math.max(0, Math.min(200, args.maxTotalBatches)) : 0;
 const specs = toRepoSpecs(args.repos);
 const targets: RepoSpec[] =
   specs.length > 0 ? specs : [{ name: "当前工作区", url: "", ref: "", localPath: "." }];
@@ -411,22 +412,27 @@ interface BatchJob {
   map: string;
 }
 
-const batchJobs: BatchJob[] = [];
+const allBatchJobs: BatchJob[] = [];
 const batchNotes: string[] = [];
 for (const scan of scans) {
   const grouped = groupByPath(scan.items);
-  const packed = packBatches(grouped, maxFilesPerBatch, maxBatchesPerRepo);
-  if (packed.overflow.length > 0) {
-    batchNotes.push(`${scan.repo.name}: 超出批次上限未复核 ${packed.overflow.length} 个文件`);
-  }
-  packed.batches.forEach((groups, index) => {
-    batchJobs.push({ repo: scan.repo, index, groups, map: scan.plan.map });
+  const batches = packBatches(grouped, maxFilesPerBatch);
+  batches.forEach((groups, index) => {
+    allBatchJobs.push({ repo: scan.repo, index, groups, map: scan.plan.map });
   });
   scan.plan.skipped.forEach((note) => batchNotes.push(`${scan.repo.name}: ${note}`));
   scan.tool.notCovered.forEach((note) => batchNotes.push(`${scan.repo.name}: ${note}`));
   scan.coverage.forEach((note) => batchNotes.push(`${scan.repo.name}: ${note}`));
 }
-log(`共 ${batchJobs.length} 个批次`);
+let batchJobs = allBatchJobs;
+if (maxTotalBatches > 0 && batchJobs.length > maxTotalBatches) {
+  const dropped = batchJobs.slice(maxTotalBatches);
+  batchNotes.push(
+    `超出全局批次预算 ${maxTotalBatches}:未复核 ${dropped.length} 个批次、${dropped.reduce((sum, job) => sum + job.groups.length, 0)} 个文件`,
+  );
+  batchJobs = batchJobs.slice(0, maxTotalBatches);
+}
+log(`共 ${batchJobs.length} 个批次(并发由 CreateWorkflow 的 max_concurrency 控制)`);
 
 phase("扫描:复核命中批次");
 const batched = await Promise.all(

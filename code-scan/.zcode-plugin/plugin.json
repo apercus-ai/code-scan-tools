@@ -1,6 +1,6 @@
 {
   "name": "code-scan",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "跨仓库全库扫描:质量、冗余、性能三维度,Devin Agentic MapReduce 复刻",
   "author": { "name": "Your team" },
   "skills": "./skills",

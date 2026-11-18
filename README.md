@@ -65,11 +65,15 @@ ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapR
 
 命令解析 `ListModels` 后作为 `subagent_model` 传给工作流——整次扫描的所有子 agent 统一使用；不指定则用会话默认模型。
 
-### 调整分片预算
+### 调整分片与并发
 
 ```
-/code-scan repos=[...] maxFilesPerBatch=8 maxBatchesPerRepo=4
+/code-scan repos=[...] maxFilesPerBatch=8 concurrency=4
 ```
+
+- `maxFilesPerBatch`:每批文件数(默认 8)。批次数按命中规模自动生成,**默认不设总批上限**
+- `concurrency`:并发上限,传给 `CreateWorkflow` 的 `max_concurrency`(建议 4,不传则运行时自适应)
+- `maxTotalBatches`(可选,默认 0 = 不限):想设全局批次预算时才用;超出会显式写进 notCovered
 
 ## 输出
 
@@ -80,7 +84,8 @@ ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapR
 
 ## 成本与安全
 
-- 每个仓库 = 规划员 1 + 工具执行员 1；每批次 = 审查员 1；每条发现 = 复核员 1；再加评审长与全局评审员各 1
+- 每个仓库 = 规划员 1 + 工具执行员 1;每批次 = 审查员 1;每条发现 = 复核员 1;再加评审长与全局评审员各 1
+- **批次数随命中规模增长**（每批 8 个文件），成本按会话数线性上升；`max_concurrency` 只控制同时跑几个，不控制总量
 - 全程只读：审查员与复核员不编辑文件；扫描不会自动开 PR
 - 选择器单次命中上限 2000（超出会记录进 notCovered 而不是静默截断）
 
