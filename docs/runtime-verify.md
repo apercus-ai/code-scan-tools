@@ -423,7 +423,10 @@ world.run("docker", [
   "--mount", "type=bind,source=<仓库绝对路径>,target=/src,readonly",
   // 依赖来自 install 阶段产物。volume 的【根】就是依赖树根(见 §5.2.5 的发布步骤),
   // 所以直接挂到 /src/node_modules,得到 /src/node_modules/express。
-  "--mount", "type=volume,source=<DEPS_VOLUME>,target=/src/node_modules,readonly",
+  "--mount", "type=volume,source=<DEPS_VOLUME>,target=/deps,readonly",
+  "-e", "NODE_PATH=/deps/tree",
+  // 依赖装在卷的子目录 tree;仓库自带 node_modules 用空 tmpfs 遮蔽(目标存在才挂得上),
+  // createRequire 的 bare 解析会落到 /deps/tree。
   "--workdir", "/src",
   "-e", "HOME=/tmp",
   "-e", "TMPDIR=/tmp",
@@ -663,9 +666,11 @@ try {
   fs.writeFileSync('/tmp/npm-userconfig', '');
   fs.writeFileSync('/tmp/npm-globalconfig', '');
 
-  // 只复制 manifest 进安装子目录;不复制任何 .npmrc
-  const stage = '/deps/stage';
+  // 只复制 manifest 进 tmpfs 里的暂存目录;不复制任何 .npmrc
+  const stage = '/tmp/stage';
+  const target = '/deps/tree';
   fs.mkdirSync(stage, { recursive: true, mode: 0o777 });
+  fs.mkdirSync(target, { recursive: true, mode: 0o777 });
   for (const f of ['package.json', 'npm-shrinkwrap.json', 'package-lock.json']) {
     const from = path.join('/src', f);
     if (fs.existsSync(from)) fs.copyFileSync(from, path.join(stage, f));
@@ -711,13 +716,15 @@ try {
   // 发布:把 stage/node_modules 的内容移到 volume 根,使 /deps 本身就是依赖树。
   // repro 因此可以把 volume 根挂到 /src/node_modules,得到 /src/node_modules/express。
   for (const name of fs.readdirSync(path.join(stage, 'node_modules'))) {
-    fs.renameSync(path.join(stage, 'node_modules', name), path.join('/deps', name));
+    const dst = path.join(target, name);
+    fs.rmSync(dst, { recursive: true, force: true });
+    fs.cpSync(path.join(stage, 'node_modules', name), dst, { recursive: true });
   }
   fs.rmSync(stage, { recursive: true, force: true });
 
   // 成功标记:只有它存在且 fingerprint 匹配才算装好
   // (volume 由 Docker 在启动前创建,「volume 存在」不等于「装完了」)
-  fs.writeFileSync('/deps/.code-scan-install-ok', JSON.stringify({
+  fs.writeFileSync(target + '/.code-scan-install-ok', JSON.stringify({
     fingerprint: process.env.DEPS_FINGERPRINT || '',
     offline: OFFLINE,
     at: new Date().toISOString(),
@@ -768,7 +775,7 @@ offline 模式挂 `<home>/.npm`(缓存**根**)只读到 `/npm-cache`。它由 `N
     - 删除失败(仍被引用)→ 该仓库 `unavailable`,不绕过
 - **并发保护**:`code-scan-deps-lock-<volumeName>` 标记 + 短忙等;拿不到锁 → 该仓库 `unavailable`,不阻塞其它仓库
 - **不自动删除**:volume 会累积;审计目录记录本次用的 volume 名与 fingerprint,用户可自行 `docker volume rm`
-- repro 阶段**只读挂载**:`type=volume,source=<v>,target=/src/node_modules,readonly`(volume 根就是依赖树)
+- repro 阶段**只读挂载** `type=volume,source=<v>,target=/deps,readonly`,并设 `NODE_PATH=/deps/tree`;仓库自带 `node_modules` 用空 tmpfs 遮蔽
 
 #### 5.2.6 安装失败与降级分类
 
@@ -954,7 +961,7 @@ runtimeVerifyOnline:
 | `MAX_REPRO` | 12 | 按严重度取前 12 条 |
 | `REPRO_SCRIPT_MAX_BYTES` | 8192 | **按 UTF-8 字节**,不是字符(见下) |
 | `REPRO_TIMEOUT_MS` | 60000 | 容器内脚本 52s + docker 启动余量 |
-| `REPRO_IMAGE` | `node:22-slim@sha256:<实现时填真实 digest>` | 钉死,不可配置 |
+| `REPRO_IMAGE` | `node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee` | 钉死,不可配置;已在实现里填好 |
 | `REPRO_IMAGE_NPM_MAJOR` | `10` | 镜像自带 npm 的主版本(`node:22-slim` = npm 10.x)。探测时用 `npm --version` 比对,不符即整体停用——§5.2.3 第 3 条的 `ignore-scripts` 传播结论只在被核对的版本上有依据 |
 | `RATIO_MIN` / `RATIO_MAX` | 2.5 / 100 | 模型给的 `threshold` **越界即拒绝 spec,不钳制**。**下限 2.5 而非 1.5**:纯线性代码 n→2n 的耗时比通常就在 2 附近,阈值低于 2.5 会把 O(n) 判成超线性 |
 | `RATIO_FLOOR_MS` | 50 | `t1Ms` 低于此值时 `ratio-greater` 判无效 |
@@ -1058,7 +1065,7 @@ runtimeVerifyOnline:
 | 43 | **offline 默认零出网** | 默认模式跑一次 install(缓存已预热) | 成功;`docker inspect` 显示 `"NetworkMode": "none"`,且缓存挂载源是 `<home>/.npm`(根)而不是 `_cacache` |
 | 44 | **offline 缺包可诊断** | 用一个缓存里没有的依赖 | `unavailable`,note 含「缓存缺包」与 `runtimeVerifyOnline=true` 提示 |
 | 45 | **拒绝原因不含凭据** | `"private-git": "git+https://ci:tok3n@github.com/x/y.git"` | note 与审计目录里没有 `tok3n`;只有 key 名 |
-| 46 | **体积层级正确** | 装完 express 后跑 repro | `/src/node_modules/express` 存在(不是 `/src/node_modules/node_modules/express`) |
+| 46 | **体积层级正确** | 装完 express 后跑 repro | 依赖在卷的 `/deps/tree/express`(不是 `/deps/tree/node_modules/express`);`createRequire` + `NODE_PATH=/deps/tree` 能解析;仓库自带 `node_modules` 被空 tmpfs 遮蔽 |
 | 47 | **半成品不被复用** | install 中途 kill,再跑一次 | 检测到标记缺失/fingerprint 不匹配 → 重装 |
 | 48 | **非 ASCII 仓库名可用** | `repos=[{name:"当前工作区",path:"."}]` | volume 名合法(hex),安装正常 |
 | 49 | **镜像内 npm 版本门禁** | 单元级:把 `REPRO_IMAGE_NPM_MAJOR` 改成与镜像不符的值 | 探测阶段停用 → 整体 `notCovered`,不进入 install;不会带着未核对的 npm 语义执行 |
@@ -1105,7 +1112,7 @@ runtimeVerifyOnline:
 |---|---|---|
 | `VOLUME_PREP_CODE` 是 host 片段 | 两次直接 `world.run("docker", ...)` | chown 必须在容器里做,再包一层 node 片段没有意义 |
 | 审计只记录脱敏后的输出 | `AUDIT_WRITE_CODE` 对**所有**写入内容先脱敏 | spec/argv 里也可能带出证据中的凭据(验收 #19) |
-| `REPRO_IMAGE` 实现时填真实 digest | 常量带占位符 `__REPRO_IMAGE_DIGEST__`;探测阶段解析 tag 的 digest 后**停用并报告该值** | 实现机上 Docker daemon 未运行、Docker Hub 不可达,无法得到可信 digest;硬填一个假值等于把「钉死」变成谎言 |
+| `REPRO_IMAGE` 实现时填真实 digest | 已填 `sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee`;常量若被改回占位符,探测阶段会解析 tag 的 digest 后停用并报告该值 | 实现时 daemon 未运行、Docker Hub 不可达;digest 是在本地拉取镜像后从 RepoDigests 读到的,不是猜的 |
 | `MAX_REPRO` 只按严重度 | high/medium **且** Ground 通过才会被选中 | §10 的 v1 范围 |
 | 三个 audit 文件 | 固定名 `spec-<n>.json` / `argv-<n>.json` / `output-<n>.json`,`flag:"wx"`;`REPRO_SPEC_B64` 在 argv 审计里替换成占位符 | §6.1 的固定命名 |
 
@@ -1115,6 +1122,7 @@ runtimeVerifyOnline:
 - 锁是 `os.tmpdir()` 下的原子 `mkdirSync`(`LOCK_CODE`),跨进程有效;拿不到锁 → 该仓库 `unavailable`,不阻塞其它仓库
 - 卷名 = `code-scan-deps-<sha256(仓库标识) 前 20 位>-<fingerprint 前 16 位>`;仓库标识用 `repos` 里用户给的 key,**不用** `package.json#name`
 - 容器名 = `code-scan-repro-<AUDIT_ID>-<repoId>-<角色/序号>`;`finally` 里无条件 `docker rm -f`
+- **执行时发现**:①只读 bind 里不存在 `/src/node_modules` 时,Docker 无法创建挂载点(runc EROFS);②Docker Desktop 会把命名卷的**卷根**按挂载容器的用户重设成 root/0755,chown 与 chmod 都不可靠。所以依赖统一装在卷的**子目录** `/deps/tree`(卷根只用来存放它),repro 挂 `/deps` + `NODE_PATH=/deps/tree`;仓库自带 `node_modules` 用空 tmpfs 遮蔽(目标存在才挂得上)
 - 链接遍历只跳过仓库根的 node_modules(它会被只读依赖卷覆盖);嵌套 node_modules 让该仓库整体跳过,否则自带依赖会绕过安装策略;没有 package.json 的仓库用空 tmpfs 覆盖 /src/node_modules
 - 每次 docker 调用前重做一次顶替检查;命名容器统一走 callDockerOnce,finally 里无条件 rm -f
 - 拿到安装锁后再读一次成功标记:等锁期间别的扫描装好了就复用,不删卷不重装

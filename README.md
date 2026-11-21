@@ -114,10 +114,11 @@ ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapR
 
 - 在隔离容器里安装依赖并执行仓库代码，为 high/medium 发现跑一段最小复现脚本（最多 12 条，顺序执行）
 - 安装默认 **offline**：`--network=none` + `npm ci --offline`，只读挂载本机 `~/.npm` 缓存；缺包会 `unavailable` 并提示先在本地预热或加 `runtimeVerifyOnline=true`
-- 只接受满足以下条件的仓库：lockfileVersion 2/3 且有非空 packages 表（拒绝 v1 形状）、每条 `resolved` 指向 `registry.npmjs.org` 且有 `integrity`、**没有任何生命周期脚本**（无白名单，husky 也拒）、无 workspace 协议、无项目 `.npmrc`；不满足就整体跳过并写明原因（`unavailable`）
+- 只接受满足以下条件的仓库：lockfileVersion 2/3 且有非空 packages 表（拒绝 v1 形状）、每条 `resolved` 指向 `registry.npmjs.org` 且 `integrity` 非空、**没有任何生命周期脚本**（无白名单，husky 也拒）、无 workspace 协议、无项目 `.npmrc`；不满足就整体跳过并写明原因（`unavailable`）
+- 依赖装在卷的子目录 `/deps/tree`；复现容器挂 `/deps` 并设 `NODE_PATH=/deps/tree`，仓库自带的 `node_modules` 用空 tmpfs 遮蔽
 - 复现容器：`--network=none`、`--read-only`、非 root、`cap-drop=ALL`、pids/memory/cpu 限制；仓库只读挂载，依赖来自只读卷，脚本只写容器 tmpfs
 - **结论含义严格限定为「脚本返回了符合断言的数据」**：脚本必须 `require` 仓库代码，二者同进程，仓库代码可以干扰返回值，所以它不是独立证明，永不用于自动 dismiss；`notReproduced` 只显示「脚本未观察到预期行为」
-- 镜像按 digest 钉死。模板里的 `REPRO_IMAGE` 初始是占位符：第一次开启时功能会自停用，并在 `notCovered` 里给出从 tag 解析到的 digest，把它填回常量后再跑
+- 镜像按 digest 钉死：sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee（node:22-slim）。tag 在 registry 上移动也不影响按 digest 拉取
 - 审计目录在系统临时目录（`mkdtemp`），记录脚本全文、容器 argv、脱敏后的输出；报告里给出路径
 - Docker daemon 未运行、context 不是本机、工作区里有 `docker` shim、仓库含符号链接、路径含逗号、含嵌套 `node_modules`（自带依赖会绕过安装策略）→ 整体或该仓库跳过，扫描其余部分照常完成
 - 依赖安装按仓库一次，卷名为 `code-scan-deps-<仓库标识hex>-<fingerprint>`；只有「成功标记存在且 fingerprint 匹配」才复用，半成品不会被复用

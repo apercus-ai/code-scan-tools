@@ -82,7 +82,7 @@ description: 跨仓库全库扫描(质量/冗余/性能),Devin Agentic MapReduce
 8. 说明选择器复用:同 `goal` 重跑会直接复用 `.code-scan/selectors/<repo>.json`;需要重新规划时用 `refreshSelectors=true`。
 9. 说明改模型用 `/code-scan-models`;配置在 `<home>/.zcode/code-scan-models.json`,不需要改共享脚本。
 10. 扫描只读,不要修改任何仓库文件。用户要求修某几条发现时,改用 `/code-scan-fix`。
-11. 开了 `runtimeVerify` 时说明:结论是脚本自报(不是独立证明),`notReproduced` 只表示「脚本未观察到预期行为」;镜像 digest 未钉死时功能会自停用并在 notCovered 里给出应填的值。
+11. 开了 `runtimeVerify` 时说明:结论是脚本自报(不是独立证明),`notReproduced` 只表示「脚本未观察到预期行为」;镜像已按 digest 钉死,若 daemon 未运行功能会静默降级并写进 notCovered。
 
 ## 规则
 

@@ -475,7 +475,7 @@ const REPRO_TIMEOUT_MS = 60000;
  * 并把从 tag 解析到的 digest 写进 notCovered,提示钉死。
  */
 const REPRO_IMAGE_TAG = "node:22-slim";
-const REPRO_IMAGE = `${REPRO_IMAGE_TAG}@sha256:__REPRO_IMAGE_DIGEST__`;
+const REPRO_IMAGE = `${REPRO_IMAGE_TAG}@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee`;
 /** 镜像自带 npm 的主版本;不符即停用,因为安装语义按它核对过。 */
 const REPRO_IMAGE_NPM_MAJOR = 10;
 /** 性能断言阈值区间:越界即拒绝 spec,不钳制。下限 2.5 是因为线性 n→2n 的比值就在 2 附近。 */
@@ -988,7 +988,7 @@ try {
         PATH: process.env.PATH,
         HOME: '/tmp',
         TMPDIR: '/tmp',
-        NODE_PATH: '/src/node_modules',
+        NODE_PATH: process.env.NODE_PATH || '/src/node_modules',
       },
     });
     let payload = null;
@@ -1102,8 +1102,10 @@ try {
   fs.writeFileSync('/tmp/npm-userconfig', '');
   fs.writeFileSync('/tmp/npm-globalconfig', '');
 
-  const stage = '/deps/stage';
+  const stage = '/tmp/stage';
+  const target = '/deps/tree';
   fs.mkdirSync(stage, { recursive: true, mode: 0o777 });
+  fs.mkdirSync(target, { recursive: true, mode: 0o777 });
   for (const f of ['package.json', 'npm-shrinkwrap.json', 'package-lock.json']) {
     const from = path.join('/src', f);
     if (fs.existsSync(from)) fs.copyFileSync(from, path.join(stage, f));
@@ -1147,11 +1149,13 @@ try {
   }
 
   for (const name of fs.readdirSync(path.join(stage, 'node_modules'))) {
-    fs.renameSync(path.join(stage, 'node_modules', name), path.join('/deps', name));
+    const dst = path.join(target, name);
+    fs.rmSync(dst, { recursive: true, force: true });
+    fs.cpSync(path.join(stage, 'node_modules', name), dst, { recursive: true });
   }
   fs.rmSync(stage, { recursive: true, force: true });
 
-  fs.writeFileSync('/deps/.code-scan-install-ok', JSON.stringify({
+  fs.writeFileSync(target + '/.code-scan-install-ok', JSON.stringify({
     fingerprint: process.env.DEPS_FINGERPRINT || '',
     offline: OFFLINE,
     at: new Date().toISOString(),
@@ -2324,6 +2328,8 @@ interface RepoRuntime {
   state: "ready" | "none" | "failed";
   /** 状态说明,写进报告。 */
   note: string;
+  /** 仓库根是否已有 node_modules 目录;决定依赖卷挂在 /src/node_modules 还是 /deps。 */
+  mountNodeModules?: boolean;
 }
 
 /** 读安装成功标记;null 表示读不到。 */
@@ -2344,7 +2350,7 @@ async function readInstallMarker(ref: string, image: string, volume: string, pha
       "--mount", `type=volume,source=${volume},target=/deps,readonly`,
       "--entrypoint", "node",
       image,
-      "-e", "const fs=require('fs');try{process.stdout.write(fs.readFileSync('/deps/.code-scan-install-ok','utf8'));}catch(e){process.stdout.write('');}",
+      "-e", "const fs=require('fs');try{process.stdout.write(fs.readFileSync('/deps/tree/.code-scan-install-ok','utf8'));}catch(e){process.stdout.write('');}",
     ],
     REPRO_TIMEOUT_MS,
   );
@@ -2447,8 +2453,24 @@ async function prepareRepoRuntime(target: PreparedRepo, probe: RuntimeProbe): Pr
   if (!presenceKnown) {
     return { dir: real, depsVolume: "", state: "failed", note: "无法确认 package.json 是否存在,运行时复现跳过" };
   }
+  // /src 是只读 bind:目标目录不存在时 Docker 无法创建挂载点,所以依赖卷挂 /deps + NODE_PATH。
+  // 仓库根有 node_modules 时再用空 tmpfs 遮蔽它(目标存在才挂得上)。
+  let hasNodeModules = false;
+  let nmKnown = false;
+  try {
+    const presence = await fsPresence([`${real}/node_modules`]);
+    if (presence !== null) {
+      nmKnown = true;
+      hasNodeModules = presence[0] === true;
+    }
+  } catch {
+    nmKnown = false;
+  }
+  if (!nmKnown) {
+    return { dir: real, depsVolume: "", state: "failed", note: "无法确认 node_modules 是否存在,运行时复现跳过" };
+  }
   if (!hasManifest) {
-    return { dir: real, depsVolume: "", state: "none", note: "" };
+    return { dir: real, depsVolume: "", state: "none", note: "", mountNodeModules: hasNodeModules };
   }
   // 五项 manifest 检查(只解析,不执行)。
   let check: unknown = null;
@@ -2512,7 +2534,7 @@ async function prepareRepoRuntime(target: PreparedRepo, probe: RuntimeProbe): Pr
   // phase 参与容器名:world.run 按参数缓存,前后两次读取必须参数不同,否则第二次会命中第一次的缓存。
   const existing = await readInstallMarker(runRef, REPRO_IMAGE, volume, "pre");
   if (existing !== null && existing.fingerprint === fingerprint) {
-    return { dir: real, depsVolume: volume, state: "ready", note: "复用已装依赖" };
+    return { dir: real, depsVolume: volume, state: "ready", note: "复用已装依赖", mountNodeModules: hasNodeModules };
   }
   const lockName = `deps-${clip(volume, 120)}`;
   if (!(await lockDeps(lockName, 30000, "acquire"))) {
@@ -2529,7 +2551,7 @@ async function prepareRepoRuntime(target: PreparedRepo, probe: RuntimeProbe): Pr
     // 等锁期间其他扫描可能已经装好:标记匹配就复用,不删卷、不重装。
     const afterLock = await readInstallMarker(runRef, REPRO_IMAGE, volume, "lock");
     if (afterLock !== null && afterLock.fingerprint === fingerprint) {
-      return { dir: real, depsVolume: volume, state: "ready", note: "复用已装依赖(等锁期间完成)" };
+      return { dir: real, depsVolume: volume, state: "ready", note: "复用已装依赖(等锁期间完成)", mountNodeModules: hasNodeModules };
     }
     // 异常遗留:名字已含 fingerprint,标记不匹配只可能是旧产物;删掉重建,不原地清空。
     const removed = await callDocker(["volume", "rm", volume], 60000);
@@ -2554,6 +2576,7 @@ async function prepareRepoRuntime(target: PreparedRepo, probe: RuntimeProbe): Pr
         "--user", "0:0",
         "--cap-drop=ALL",
         "--cap-add=CHOWN",
+        "--cap-add=FOWNER",
         "--pids-limit", "64",
         "--memory", "512m", "--memory-swap", "512m",
         "--cpus", "1",
@@ -2561,7 +2584,7 @@ async function prepareRepoRuntime(target: PreparedRepo, probe: RuntimeProbe): Pr
         "--mount", `type=volume,source=${volume},target=/deps`,
         "--entrypoint", "node",
         REPRO_IMAGE,
-        "-e", "require('fs').chownSync('/deps',65534,65534)",
+        "-e", "const fs=require('fs');fs.mkdirSync('/deps/tree',{recursive:true});fs.chmodSync('/deps/tree',0o777);fs.chownSync('/deps/tree',65534,65534)",
       ],
       REPRO_TIMEOUT_MS,
     );
@@ -2634,7 +2657,7 @@ async function prepareRepoRuntime(target: PreparedRepo, probe: RuntimeProbe): Pr
     if (marker === null || marker.fingerprint !== fingerprint) {
       return { dir: real, depsVolume: "", state: "failed", note: "安装成功标记缺失或 fingerprint 不匹配,运行时复现跳过" };
     }
-    return { dir: real, depsVolume: volume, state: "ready", note: "本次安装依赖" };
+    return { dir: real, depsVolume: volume, state: "ready", note: "本次安装依赖", mountNodeModules: hasNodeModules };
   } finally {
     // world.run 超时不会返回容器 ID;名字是确定性的,可以无条件盲删安装容器。
     await callDocker(["rm", "-f", installName], 30000);
@@ -2831,10 +2854,12 @@ async function runRepro(job: ReproJob, repo: RepoRuntime, caps: RuntimeCaps, ind
     "--mount", `type=bind,source=${repo.dir},target=/src,readonly`,
   ];
   if (repo.depsVolume !== "") {
-    // 卷根就是依赖树根(installer 把 stage/node_modules 的内容发布到 /deps)。
-    argv.push("--mount", "type=volume,source=" + repo.depsVolume + ",target=/src/node_modules,readonly");
-  } else {
-    // 没有 package.json:用空 tmpfs 覆盖 /src/node_modules,别让仓库自带的依赖被加载。
+    // 依赖装在卷的子目录 tree 里(卷根会被 Docker Desktop 按挂载用户重设,不能依赖它可写)。
+    argv.push("--mount", "type=volume,source=" + repo.depsVolume + ",target=/deps,readonly");
+    argv.push("-e", "NODE_PATH=/deps/tree");
+  }
+  if (repo.mountNodeModules === true) {
+    // 仓库自带 node_modules:用空 tmpfs 覆盖(目标存在,只读 bind 里可挂),再靠 NODE_PATH 解析到 /deps/tree。
     argv.push("--mount", "type=tmpfs,destination=/src/node_modules,tmpfs-size=16m,tmpfs-mode=0555");
   }
   argv.push(
