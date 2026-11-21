@@ -1,35 +1,45 @@
 # code-scan-tools
 
-ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapReduce 方式实现——**规划员写作用于全库的确定性选择规则（selectors），规则先在全库执行，命中项才分片复核**。另外加了 Devin 公开描述之外的逐条独立复核。
+ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapReduce 方式实现。核心是**选择器 v2**：规划员写作用于全库的确定性规则（scope/grep/AST/依赖图/工具），脚本在全库确定性执行，只有产生信号的文件才分片复核；规则可持久化、可复用、可审计。
 
 > 本仓库为团队内部私有工具仓库。安装后成员可在任意工作区用 `/code-scan` 扫描一个或多个仓库。
 
 ## 它做什么
 
-- **全局优先**：plan→shard 之间，全库 glob/grep/工具查询先跑完，死代码、跨模块重复这类全局问题不会因分片被切碎
-- **跨仓库**：一次运行可指定多个仓库（Git URL 或工作区内路径），克隆到 `.code-scan/repos/` 后逐个扫描，汇总成一份跨仓库报告
+- **全库规则先行**：plan→shard 之间，脚本用 glob/grep/ast-grep/knip/jscpd/madge 在整库跑完规则，死代码、跨模块重复、循环依赖这类全局问题不靠分片运气
+- **AST 与关系查询**：ast-grep 模式（空 catch、循环内 await、forEach 异步…）与规则 JSON（`inside`/`has`/`follows`/`all`/`any`）都能作为选择器
+- **依赖图规则**：madge 模块边 + 脚本内 SCC：`cycle`、`orphan`、`layering`
+- **工具候选**：knip（未使用导出/依赖）、jscpd（重复代码）由脚本执行并解析 JSON，不再经过 agent
+- **信号分片**：只有产生信号的文件进入批次；按信号数、扇入、路径排序后按文件数切批
+- **预算与采样**：每条选择器默认上限 200 条命中，超出按路径确定性采样并记录；批次按文件数与信号量（≤60）切分，提示词每文件展示前 12 条信号，未展示部分写进 notCovered
+- **试跑与修订**：全库试跑后，零命中的死规则与超量规则交规划员修订一轮
+- **规则持久化**：选择器、仓库地图、试跑统计写入 `.code-scan/selectors/<repo>.json`；同 goal 重跑直接复用
+- **跨仓库**：一次运行可指定多个仓库（Git URL 或工作区内路径），汇总成一份跨仓库报告
 - **三维度**：质量（可读性/边界/一致性）、冗余（死代码/重复实现/未使用导出）、性能（复杂度/N+1/重复 I/O）
-- **证据 + 复核**：每条发现必须引用具体文件行（性能类必须复杂度论证或基准数据）；每条发现由独立复核员复现，未能复现标 `unconfirmed`
+- **证据 + 复核**：每条发现必须引用具体文件行（性能类必须复杂度论证或基准数据）；每条发现由确定性检查复现证据——文件存在、行号在范围内、引文能在引用行附近找到——不花模型调用，未通过标 `unconfirmed`
 - **全局审查**：Reduce 后追加跨批次模式审查（重复/不一致/分层违规）
-- **看板 + 报告**：运行中实时更新发现看板，结束后发布 markdown 报告
-- **模型可指定**：运行时指定扫描模型（`subagent_model`），默认用会话模型
+- **看板 + 报告**：扫描结束后发布发现看板与 markdown 报告（含选择器执行表）
+- **按阶段模型**：`/code-scan-models` 用 `ListModels` 读取本机模型目录，按阶段选择并保存为每人自己的配置；`/code-scan` 读取配置生成带模型字面量的草稿，未配置的阶段继承 run 级 `model=`/会话模型
 
 ## Devin 对照
 
 | Devin Code Scans 方面 | 本仓库 | 说明 |
 |---|---|---|
 | 目标驱动（goal） | ✅ | 命令接受 goal，影响选择规则与复核侧重 |
-| Planner 写全库规则 | ✅ | 规划员产出 `selectors`（glob/grep/tool），不是文件清单 |
-| 规则先在全库执行 | ✅ | 脚本用 `files.glob`/`files.grep` 执行，命中项才进批次 |
-| 确定性分片 | ✅ | 命中项按路径排序后按文件数切批，非随机 |
+| Planner 写全库规则 | ✅ | 规划员产出 `selectors`（scope/grep/ast/graph/tool），不是文件清单 |
+| 规则先在全库执行 | ✅ | 脚本确定性执行；工具输出由脚本解析 |
+| selector 可审计/可复用 | ✅ | `.code-scan/selectors/<repo>.json`；同 goal 复用，可人工审阅 |
+| AST / 符号 / 依赖图查询 | ⚠️ | AST 与依赖图已支持；符号级靠 knip（TS）；类型感知跨文件查询、函数级调用图未做 |
+| 确定性分片 | ✅ | 只有信号文件进批次；按信号数/扇入/路径排序 |
 | 并行 Map agents | ✅ | 每批次一个独立上下文的审查员 |
 | Reduce 聚合去重排序 | ✅ | 评审长去重、按严重度排序 |
-| 扫描器接入 | ✅ | 工具执行员跑 knip/jscpd/madge，候选进批次复核 |
+| 扫描器接入 | ⚠️ | 接 knip/jscpd/madge/ast-grep；未接商业扫描器（Snyk/SonarQube 等） |
 | 跨批次全局审查 | ✅ | 全局评审员找重复/不一致/分层违规 |
 | 证据 + 严重度 | ✅ | 每条发现带 evidence / severity |
 | 发现清单/看板 | ⚠️ | ZCode artifact 看板 + markdown 报告替代专用 UI |
 | 挑选后开 PR | ⚠️ | 由 `/code-scan-fix` 后续任务实现（扫描只读） |
-| 运行时漏洞验证（VM） | ❌ | 未实现，安全维度只做静态分析 |
+| 增量扫描 | ❌ | 每次全量浅克隆；`scan new commits` 未实现 |
+| 运行时漏洞验证（VM） | ❌ | 未实现，也没有 security 维度 |
 | 托管 UI / 专有模型 | ❌ | 无，本地运行 |
 
 ## 安装
@@ -57,37 +67,96 @@ ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapR
 
 克隆目标固定在工作区下的 `.code-scan/repos/`（已 gitignore）。**重跑前请删除该目录**，否则 `git clone` 会因目录已存在而失败。
 
-### 指定扫描模型
+### 选择器复用
+
+选择器存档在 `.code-scan/selectors/<repo>.json`。同一 `goal` 再次运行时直接复用，只做试跑与必要修订；想重新规划：字段与执行语义见 [docs/selectors.md](docs/selectors.md)。
+
+```
+/code-scan refreshSelectors=true
+```
+
+### 按阶段选择模型
+
+先运行一次：
+
+```
+/code-scan-models
+```
+
+它会读取本机 ZCode 模型目录，按阶段（规划/修订/批次审查/逐条复核/评审长/全局评审/全局复核）弹出选择面板，保存到 `~/.zcode/code-scan-models.json`。成员各自配置，互不影响。
+
+之后 `/code-scan` 自动读取这份配置，校验模型仍存在且没有 `disabledReason`（`reasoningLevels` 里的 `disabled` 是档位名，不算禁用），再生成一份带模型字面量的草稿脚本启动。改模型就再跑一次 `/code-scan-models`，不需要改文件。
+
+`model="..."` 仍然可用，但它只是 **run 级默认模型**，只影响没有单独配置的阶段：
 
 ```
 /code-scan repos=[...] model="GLM-5.3-Flash"
 ```
 
-命令解析 `ListModels` 后作为 `subagent_model` 传给工作流——整次扫描的所有子 agent 统一使用；不指定则用会话默认模型。
+命令会先用 `ListModels` 解析成完整 `providerId/modelId`，再作为 `subagent_model` 传入；裸名只在会话 provider 内解析。
 
-### 调整分片与并发
+### 调整预算、分片与并发
 
 ```
-/code-scan repos=[...] maxFilesPerBatch=8 concurrency=4
+/code-scan repos=[...] maxFilesPerBatch=8 selectorBudget=200 concurrency=4
 ```
 
-- `maxFilesPerBatch`:每批文件数(默认 8)。批次数按命中规模自动生成,**默认不设总批上限**
-- `concurrency`:并发上限,传给 `CreateWorkflow` 的 `max_concurrency`(建议 4,不传则运行时自适应)
-- `maxTotalBatches`(可选,默认 0 = 不限):想设全局批次预算时才用;超出会显式写进 notCovered
+- `selectorBudget`:每条选择器的默认命中上限（默认 200，允许 20–2000）；超出按路径确定性采样并写进 notCovered
+- `maxFilesPerBatch`:每批信号文件数（默认 8，允许 3–20）。批次数按信号规模自动生成，**默认不设总批上限**
+- `concurrency`:并发上限，传给 `CreateWorkflow` 的 `max_concurrency`（建议 4，不传则运行时自适应）
+- `maxTotalBatches`（可选，默认 0 = 不限，最大 200）：想设全局批次预算时才用；超出会显式写进 notCovered
+
+### 运行时复现（可选，需要 Docker）
+
+```
+/code-scan runtimeVerify=true
+```
+
+- 在隔离容器里安装依赖并执行仓库代码，为 high/medium 发现跑一段最小复现脚本（最多 12 条，顺序执行）
+- 安装默认 **offline**：`--network=none` + `npm ci --offline`，只读挂载本机 `~/.npm` 缓存；缺包会 `unavailable` 并提示先在本地预热或加 `runtimeVerifyOnline=true`
+- 只接受满足以下条件的仓库：lockfileVersion 2/3 且有非空 packages 表（拒绝 v1 形状）、每条 `resolved` 指向 `registry.npmjs.org` 且有 `integrity`、**没有任何生命周期脚本**（无白名单，husky 也拒）、无 workspace 协议、无项目 `.npmrc`；不满足就整体跳过并写明原因（`unavailable`）
+- 复现容器：`--network=none`、`--read-only`、非 root、`cap-drop=ALL`、pids/memory/cpu 限制；仓库只读挂载，依赖来自只读卷，脚本只写容器 tmpfs
+- **结论含义严格限定为「脚本返回了符合断言的数据」**：脚本必须 `require` 仓库代码，二者同进程，仓库代码可以干扰返回值，所以它不是独立证明，永不用于自动 dismiss；`notReproduced` 只显示「脚本未观察到预期行为」
+- 镜像按 digest 钉死。模板里的 `REPRO_IMAGE` 初始是占位符：第一次开启时功能会自停用，并在 `notCovered` 里给出从 tag 解析到的 digest，把它填回常量后再跑
+- 审计目录在系统临时目录（`mkdtemp`），记录脚本全文、容器 argv、脱敏后的输出；报告里给出路径
+- Docker daemon 未运行、context 不是本机、工作区里有 `docker` shim、仓库含符号链接、路径含逗号、含嵌套 `node_modules`（自带依赖会绕过安装策略）→ 整体或该仓库跳过，扫描其余部分照常完成
+- 依赖安装按仓库一次，卷名为 `code-scan-deps-<仓库标识hex>-<fingerprint>`；只有「成功标记存在且 fingerprint 匹配」才复用，半成品不会被复用
 
 ## 输出
 
 - `conclusion`：结论
-- `findings`：去重排序后的发现（`where` 带仓库前缀、`status` 为 verified/unconfirmed）
-- `notCovered`：克隆失败、选择器超限、工具缺失、批次溢出、性能未跑基准等
-- Artifact：发现看板（按严重度分列）+ markdown 报告
+- `findings`：去重排序后的发现（`where` 带仓库前缀、`status` 为 verified/unconfirmed；开了 runtimeVerify 且真跑过时带 `repro`）
+- `verified`：实际执行了什么（仓库数、信号数、批次数、工具版本；开了 runtimeVerify 时还有复现条数与成立数）
+- `notCovered`：克隆失败、选择器超限/采样、工具缺失、死规则、依赖未安装、批次溢出、性能未跑基准、运行时复现未运行/安装被拒/该仓库跳过
+- Artifact：发现看板（按严重度分列）+ markdown 报告（含选择器执行表）
 
 ## 成本与安全
 
-- 每个仓库 = 规划员 1 + 工具执行员 1;每批次 = 审查员 1;每条发现 = 复核员 1;再加评审长与全局评审员各 1
-- **批次数随命中规模增长**（每批 8 个文件），成本按会话数线性上升；`max_concurrency` 只控制同时跑几个，不控制总量
-- 全程只读：审查员与复核员不编辑文件；扫描不会自动开 PR
-- 选择器单次命中上限 2000（超出会记录进 notCovered 而不是静默截断）
+- 每个仓库 = 规划员 1（仅首次或 refresh）+ 修订员 1（仅当有死规则/超量规则）；每批次 = 审查员 1；再加评审长与全局评审员各 1。**复核不占 agent**：由确定性检查完成
+- 发现数量只防病态输出：每批次硬上限 50 条、批次间先按 `仓库+位置+问题` 去重；报告不因数量丢发现（展示上限 200 条，超出的写进 notCovered）
+- 工具执行不占 agent：knip/jscpd/madge/ast-grep 由脚本以固定命令行运行，JSON 由脚本解析
+- **批次数随信号文件规模增长**（每批 8 个文件），成本按会话数线性上升；`max_concurrency` 只控制同时跑几个，不控制总量
+- 全程只读：审查员与复核员不编辑文件；唯一工作区写入是 `.code-scan/selectors/` 的规则存档与 `.code-scan/tmp/` 的工具报告；草稿写在系统私有临时目录，不写工作区；扫描不会自动开 PR
+- 按阶段模型配置按人保存在 `~/.zcode/code-scan-models.json`；生成的草稿在系统私有临时目录；模型 id 不写进共享脚本或仓库文件
+- 草稿生成依赖 Node（`scripts/generate-draft.mjs`）；Node 不可用或生成失败时不会启动扫描
+- 每次运行生成的草稿留在系统临时目录，不会自动删除，可定期清理
+- knip 固定使用脚本写入的 **deny-all 插件配置**（所有插件名置 `false`，防止 `package.json` 插件配置执行 JS），**不读取仓库自带的 `knip.json/jsonc`**；**`knip.config.js/ts` 永不执行**，并固定 no-op `--preprocessor`；发现 `pnpm-workspace.yaml` 或**根** `package.json#knip` 时 knip 不运行；配置写入失败时本次直接不跑 knip
+- 上述 `.npmrc`/`pnpm-workspace.yaml`/工具包与 `.bin` 存在性按 Node 的 `stat`/`lstat`/`readdir` 语义判断（Windows 大小写不敏感、符号链接算存在），不用 workflow 的 `files.glob`（其 walker 大小写敏感且跳过 symlink，与 npm/knip 的 `stat` 语义不一致）
+- ast-grep 以空配置（`.code-scan/tmp/sgconfig-empty.yml`）运行并显式 `--custom-languages ignore`，不加载工作区/仓库的 sgconfig
+- madge 固定由脚本写入的安全 webpack/tsconfig/require-config（仓库自带 tsconfig 优先），`--webpack-config`/`--ts-config`/`--require-config` 覆盖 `.madgerc`/`package.json#madge` 里的可执行配置
+- 工作区**或 npm 会读取的 project `.npmrc`（npm 前缀目录、工作区根；home 与 userconfig 同路径时按 npm 行为跳过）**存在 `.npmrc` 时，**npx 工具整体停用**（ast/graph/knip/jscpd），只保留 grep；不解析 ini，避免 quoted key/`userconfig`/`script-shell`/`node-options` 绕过
+- 工作区及其祖先目录（npm run-script 的 PATH 会逐级向上）的 `node_modules/.bin` 出现与固定工具同名的条目（按目录 readdir 匹配，任意扩展名，含 `.bat/.com` 等 PATHEXT 变体），工作区根、npm 前缀或隐式 workspace 包根出现与工具同名的 PATHEXT 可执行文件（如 `jscpd.bat`；cmd 先查当前目录），或 `node_modules/<pkg>/package.json` 存在时，npx 工具同样 fail-closed，防止本地二进制顶替固定版本
+- 所有 `npx` 工具调用经 npm 自带的 `npx-cli.js`（Windows 下用 `node` 启动，避免 `npx.cmd` shim 无法直接 spawn），统一为 `--package <pkg> -- <tool>` 形式（本地包的 `bin` 名不能替换实际执行的命令），带 `--ignore-scripts`，版本固定为 `knip@6.45.1`、`jscpd@5.4.3`、`madge@8.0.0`、`@ast-grep/cli@0.51.3`
+- `repos` 的 URL 拒绝 `ext::` 等可执行远程助手与前导 `-`；git 调用强制 `protocol.ext.allow=never`；`ref` 拒绝非法 ref 字符；`path` 必须是工作区内相对路径且不能含 `..`
+- 启动时检查 `.code-scan`、`tmp`、`repos`、`selectors` 不是符号链接/联接；clone 目标叶节点也会检查；脚本写入走临时文件 + rename，jscpd 报告写到 `node mkdtemp` 的独占目录
+- 选择器文本字段拒绝控制字符与前导 `-`（防止 Windows cmd shim 注入）
+- 选择器预算默认 200、上限 2000（`selectorBudget`）；超出按路径确定性采样并记录，不静默截断
+- 规划员被要求把规则控制在 2–3 条 scope + 8–12 条信号规则；单条 grep 命中必须低于 2000 行，超过是硬拒绝（预算管不到，脚本会提示收窄 scope 而不是当成正则写错）
+- 运行时复现默认关闭（`runtimeVerify=false` 时**零次 docker 调用**）；开启后只跑 high/medium 且证据核对通过的发现，最多 12 条
+- 运行时复现**不执行仓库自带脚本**：`ignore-scripts`、拒绝任何生命周期脚本、只 `npm ci`、`--omit=optional`；git/file/workspace 依赖与私有 registry 一律拒绝。默认离线，联网要显式开 `runtimeVerifyOnline=true`
+- `docker` 的顶替检查与 npx 工具分开：工作区出现 `docker` shim 只停用运行时复现，不影响 knip/jscpd/madge/ast-grep
+- 运行时复现的判定**不是独立证明**：脚本与仓库代码同进程，仓库代码可以覆写结果文件。设计只承诺「门槛高于一句 console.log」「伪造会留痕于审计目录」「展示文案标注为脚本自报」「永不自动 dismiss」
+- 离线验收测试不依赖 Docker：`node test/runtime-verify.test.mjs`（需要 tsc 时加 `TSC=<typescript/lib/tsc.js>`）
 
 ## 目录
 
@@ -97,18 +166,27 @@ code-scan-tools/
 ├── code-scan/
 │   ├── .zcode-plugin/plugin.json
 │   ├── commands/code-scan.md
+│   ├── commands/code-scan-models.md
 │   ├── commands/code-scan-fix.md
 │   ├── skills/code-scan/SKILL.md
-│   └── scripts/code-scan.ts
+│   ├── scripts/code-scan.ts
+│   └── scripts/generate-draft.mjs
 ├── examples/repos.example.json
+├── test/runtime-verify.test.mjs
 └── docs/
     ├── devin-parity.md
-    └── rubric.md
+    ├── rubric.md
+    ├── runtime-verify.md
+    └── selectors.md
 ```
 
 ## 已知限制
 
 - 工作流脚本首次提交需过确认框（展示完整脚本），这是 ZCode 的安全设计
+- `/code-scan-models` 的面板每题最多 4 个选项：候选是前 3 个模型 + "继承运行模型"；其他模型点 Other 输入完整 id
 - `git clone` 通过 `world.run("git", ...)` 执行，确认框会列出 `git` 命令集
 - 首次运行若出现编译诊断，按提示编辑脚本文件后用 `path` 重提（不要重贴脚本）
-- 安全维度的"运行时验证"未实现；如需请另行加容器化验证阶段
+- 工具经 `node npx-cli.js --yes --ignore-scripts` 按固定版本下载（`@ast-grep/cli@0.51.3`、`knip@6.45.1`、`jscpd@5.4.3`、`madge@8.0.0`），首次调用较慢
+- 工作区（或 npm 前缀/工作区根）存在任何 `.npmrc`（含大小写变体与符号链接）时 npx 工具会 fail-closed 停用，只保留 grep；良性 `.npmrc` 也一样，这是有意的安全取舍；工作区及祖先目录 `node_modules/.bin` 含固定工具同名条目（任意扩展名），或工作区根含同名 PATHEXT 可执行文件（如 `jscpd.bat`）时同样停用
+- 浅克隆没有 `node_modules` 时，knip 的依赖解析类噪声会被过滤并注明；Python/Rust 工具包（vulture/radon/cargo udeps）尚未接入
+- 无增量扫描、无托管调度、无 security 维度与运行时验证；如需请另行加阶段
