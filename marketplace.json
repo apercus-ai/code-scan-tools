@@ -4,11 +4,11 @@
     {
       "name": "code-scan",
       "source": "./code-scan",
-      "version": "0.7.2",
-      "description": "跨仓库全库扫描:质量、冗余、性能三维度,Devin Agentic MapReduce 复刻,选择器 v2 可持久化;按阶段模型可按人配置;Windows 下经 node 启动 npx-cli.js",
+      "version": "0.8.0",
+      "description": "跨仓库全库扫描,扫描内容按模式选择(全面/性能/数据库查询/测试覆盖/死代码/代码质量/清理/遥测/无障碍/合规/迁移文档/安全/自定义),Devin Agentic MapReduce 复刻,选择器 v2 可持久化;按阶段模型可按人配置;Windows 下经 node 启动 npx-cli.js",
       "displayName": "Code Scan",
       "displayName_i18n": { "zh-CN": "跨仓库全库扫描" },
-      "description_i18n": { "zh-CN": "跨多个仓库做质量/冗余/性能扫描,全库选择器先行,产出带证据与复核的发现清单" },
+      "description_i18n": { "zh-CN": "跨多个仓库做全库扫描,扫描内容按模式选择(质量/死代码/性能/数据库/测试覆盖/清理/遥测/无障碍/合规/迁移文档等),全库选择器先行,产出带证据与复核的发现清单" },
       "category": "developer-tools"
     }
   ]

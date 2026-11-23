@@ -14,7 +14,7 @@
 | `target` | 是（可空串） | 仅 graph：layering 的目标 glob、orphan 的入口豁免 glob，逗号分隔 |
 | `exclude` | 是（可空串） | 排除的路径 glob，逗号分隔 |
 | `intent` | 是 | 一句中文，说明这条规则找什么；带给批次审查员 |
-| `dimension` | 是 | `quality` / `dead-code` / `perf` |
+| `dimension` | 是 | 维度 id，取模板 `DIMENSIONS` 注册表之一（`quality` / `dead-code` / `perf` / `db` / `coverage` / `cleanup` / `telemetry` / `a11y` / `compliance` / `security` / `migration`）；不在本次模式启用范围内的规则会被丢弃并记录 |
 | `budget` | 是 | 命中上限；0 = 用运行默认预算（200） |
 
 ## 类型
@@ -86,6 +86,8 @@ ripgrep 正则，命中行成为信号。
 |---|---|---|
 | `knip` | 未使用文件/导出/依赖 | 仓库需有 `package.json` |
 | `jscpd` | 重复代码 | JS/TS 文件 |
+| `test-reach` | 没有任何测试文件直接或经导入链引用的模块（每模块一个命中，带扇入） | 依赖图可用（madge） |
+| `a11y` | JSX/TSX 的无障碍缺陷（eslint + eslint-plugin-jsx-a11y，每条 lint 消息一个命中） | JS/TS 项目；能定位到 npm 自带的 `npm-cli.js` 与驱动脚本。工具包按固定版本装在 npm 缓存目录下的专属目录里，不写工作区，也不经 npx 启动任何命令 |
 
 ```json
 { "id": "tool-knip", "kind": "tool", "lang": "", "query": "knip", "scope": "", "target": "", "exclude": "", "intent": "未使用导出与依赖", "dimension": "dead-code", "budget": 200 }
@@ -94,7 +96,7 @@ ripgrep 正则，命中行成为信号。
 ## 执行语义
 
 1. 能力探测：`npx`（Windows 下经 `node` 启动 npm 自带的 `npx-cli.js`）、`package.json`/`tsconfig.json`、各工具可用性；不可用的类型在规范化阶段被丢弃并记入 notCovered。
-2. 执行顺序：每个仓库先准备依赖图（有 graph 规则时），再逐条执行选择器。工具按名字缓存，同一仓库只跑一次。
+2. 执行顺序：每个仓库先准备依赖图（有 graph 规则或 `test-reach` 工具规则时），再逐条执行选择器。工具按名字缓存，同一仓库只跑一次。
 3. 预算：信号按 `path`、`line` 排序后取前 `budget` 条；`hits` 是采样前总数，`sampled` 是实际进入批次的条数。
 4. 试跑统计回到规划员：零命中的死规则、被采样的超量规则会在**一轮修订**里被改掉；修订后只执行签名变化的选择器。
 5. 信号分片：按文件聚合信号；排序键依次为信号数、扇入、路径；按 `maxFilesPerBatch` 与每批 ≤60 条信号切批。批次提示词每文件最多展示前 12 条信号，超出部分写进 notCovered。
@@ -102,7 +104,7 @@ ripgrep 正则，命中行成为信号。
 
 ## 持久化
 
-写入 `.code-scan/selectors/<repo>.json`：
+每个模式一份存档。全面扫描写 `.code-scan/selectors/<repo>.json`，其他模式写 `<repo>~<模式 id>.json`（模式 id 超过 24 个字符时截断并接上完整 id 的短哈希，组合模式不会撞同一个文件）：
 
 ```json
 {
@@ -112,7 +114,7 @@ ripgrep 正则，命中行成为信号。
   "map": "仓库地图",
   "selectors": [ ... ],
   "probe": [ { "id": "sel-1", "hits": 42, "sampled": 42, "files": 7, "note": "" } ],
-  "capabilities": { "npm": true, "ast": true, "graph": true, "knip": true, "jscpd": true, "notes": [] }
+  "capabilities": { "npm": true, "ast": true, "graph": true, "knip": true, "jscpd": true, "a11y": true, "notes": [] }
 }
 ```
 
@@ -136,6 +138,6 @@ ripgrep 正则，命中行成为信号。
 
 ## 边界
 
-已支持：AST 模式与关系查询（ast-grep）、模块依赖图（madge）、TS 符号级未使用导出（knip）、重复代码（jscpd）。
+已支持：AST 模式与关系查询（ast-grep）、模块依赖图（madge）、TS 符号级未使用导出（knip）、重复代码（jscpd）、测试可达性（test-reach，基于依赖图）、JSX/TSX 无障碍（eslint + eslint-plugin-jsx-a11y）。
 
 未支持：类型感知的跨文件查询（tsserver/scip）、函数级调用图、生成 schema 对比、Python/Rust 工具包（vulture/radon/cargo udeps）、增量扫描。

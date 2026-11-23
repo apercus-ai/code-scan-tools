@@ -22,8 +22,9 @@ const SLOTS = {
   global: "/* @model:global */",
 };
 
+// plan 出现两次:规划员,以及迁移文档模式里同样在读代码追流程的追踪员。
 const EXPECTED_COUNTS = {
-  plan: 1,
+  plan: 2,
   revision: 1,
   review: 1,
   judge: 1,
@@ -40,17 +41,119 @@ const { values } = parseArgs({
     template: { type: "string" },
     config: { type: "string" },
     out: { type: "string" },
+    mode: { type: "string" },
+    "list-modes": { type: "boolean" },
   },
 });
 
 if (!values.template) {
-  fail("usage: node generate-draft.mjs --template <code-scan.ts> [--config <models.json>] [--out <.code-scan/tmp/draft.ts>]");
+  fail("usage: node generate-draft.mjs --template <code-scan.ts> [--config <models.json>] [--out <.code-scan/tmp/draft.ts>] [--mode <扫描方向>] [--list-modes]");
+}
+
+// 扫描模式表只维护模板里那一份(一行一个对象、字段顺序固定),这里按行解析,
+// 所以生成器与工作流对「有哪些模式、每个模式启用哪些维度」永远一致。
+const MODE_LINE = /^\s*\{ id: "([^"]+)", label: "([^"]+)", hint: "([^"]*)", kind: "(findings|document)", dimensions: "([^"]+)" \},?\s*$/;
+
+/** 模板里 `const NAME…= [ … ];` 这张表的正文。只在表内解析:注释或文档里的同形行不算数。 */
+function tableBody(text, name) {
+  const start = text.search(new RegExp(`^const ${name}[^=\\n]*= \\[`, "m"));
+  if (start < 0) {
+    return "";
+  }
+  const end = text.indexOf("\n];", start);
+  return end < 0 ? "" : text.slice(start, end);
+}
+
+function parseModes(text) {
+  const modes = [];
+  for (const line of tableBody(text, "SCAN_MODES").split(/\r?\n/)) {
+    const match = MODE_LINE.exec(line);
+    if (match !== null) {
+      modes.push({ id: match[1], label: match[2], hint: match[3], kind: match[4], dimensions: match[5] });
+    }
+  }
+  return modes;
+}
+
+/** 维度注册表里的 id 顺序;组合模式的维度按这个顺序排,与工作流里的 resolveMode 一致。 */
+function parseDimensions(text) {
+  return [...tableBody(text, "DIMENSIONS").matchAll(/\bid: "([^"]+)",/g)].map((match) => match[1]);
+}
+
+const modeKey = (value) => value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+
+/** 与模板里的 resolveMode 同一套规则:按 id 或名字匹配,逗号/空格分隔可以组合。 */
+function resolveMode(modes, text, template) {
+  const picked = [];
+  const unknown = [];
+  for (const token of text.split(/[,，+、/|]+|\s+/).map((item) => item.trim()).filter((item) => item !== "")) {
+    const key = modeKey(token);
+    const found = modes.find((mode) => modeKey(mode.id) === key || modeKey(mode.label) === key);
+    if (found === undefined) {
+      unknown.push(token);
+    } else if (!picked.some((mode) => mode.id === found.id)) {
+      picked.push(found);
+    }
+  }
+  if (unknown.length > 0 || picked.length === 0) {
+    fail(`未识别的扫描方向: ${unknown.join("、") || "(空)"};可选: ${modes.map((mode) => `${mode.id}(${mode.label})`).join(" / ")}`);
+  }
+  const documentModes = picked.filter((mode) => mode.kind === "document");
+  if (documentModes.length > 0) {
+    const others = picked.filter((mode) => mode.kind !== "document");
+    if (others.length > 0) {
+      console.error(
+        `generate-draft: ${documentModes.map((mode) => mode.label).join("+")} 产出文档,不能与发现类方向组合,已忽略: ${others.map((mode) => mode.label).join("、")}`,
+      );
+    }
+    const document = documentModes[0];
+    return { id: document.id, label: document.label, kind: document.kind, dimensions: document.dimensions.split(",") };
+  }
+  const dimensions = [];
+  for (const mode of picked) {
+    for (const id of mode.dimensions.split(",")) {
+      if (!dimensions.includes(id)) {
+        dimensions.push(id);
+      }
+    }
+  }
+  const registryOrder = parseDimensions(template);
+  dimensions.sort((left, right) => registryOrder.indexOf(left) - registryOrder.indexOf(right));
+  return {
+    id: picked.map((mode) => mode.id).join("+"),
+    label: picked.map((mode) => mode.label).join("+"),
+    kind: "findings",
+    dimensions,
+  };
 }
 
 const cwd = process.cwd();
 const workspace = realpathSync(cwd);
 const templatePath = resolve(values.template);
 const configPath = values.config === undefined ? undefined : resolve(values.config);
+
+// 扫描方向先校验:不认识的方向在创建任何目录之前就报错。
+let template;
+try {
+  template = readFileSync(templatePath, "utf8");
+} catch (error) {
+  fail(`cannot read template ${templatePath}: ${error instanceof Error ? error.message : String(error)}`);
+}
+const modes = parseModes(template);
+if (modes.length === 0) {
+  fail("模板里没有可解析的扫描模式表(每行一个 { id, label, hint, kind, dimensions })");
+}
+if (values["list-modes"]) {
+  for (const mode of modes) {
+    console.log(`mode: ${mode.id} | ${mode.label} | ${mode.hint}`);
+  }
+  process.exit(0);
+}
+// 没给方向就是模式表的第一项(全面扫描);输出机器可读的 id,调用方原样作为 args.mode 传入。
+const defaultMode = modes[0];
+const resolvedMode = values.mode === undefined
+  ? { id: defaultMode.id, label: defaultMode.label, kind: defaultMode.kind, dimensions: defaultMode.dimensions.split(",") }
+  : resolveMode(modes, values.mode, template);
 
 function ensureSafeDir(dir) {
   let info;
@@ -125,13 +228,6 @@ if (values.out !== undefined) {
   outputDir = realpathSync(privateDir);
   finalOutPath = join(outputDir, "draft.ts");
   writeMode = "private";
-}
-
-let template;
-try {
-  template = readFileSync(templatePath, "utf8");
-} catch (error) {
-  fail(`cannot read template ${templatePath}: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 let config = {};
@@ -238,3 +334,6 @@ if (writtenParts.length !== 1 || writtenParts[0] === "" || writtenParts[0] === "
 console.log(`draft: ${finalOutPath}`);
 console.log(`configured: ${summary.set.join(", ") || "none"}`);
 console.log(`inherit: ${summary.inherit.join(", ") || "none"}`);
+console.log(`mode: ${resolvedMode.id}`);
+console.log(`modeLabel: ${resolvedMode.label}`);
+console.log(`dimensions: ${resolvedMode.dimensions.join(",")}`);
