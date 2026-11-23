@@ -133,10 +133,11 @@ function sourceRegion(startMarker, endMarker) {
   return SOURCE.slice(start, end);
 }
 
-check("PROMPT:批次上限来自常量,没有第二个数字", () => {
+check("PROMPT:审查员不按条数设上限", () => {
+  // 批次按文件数切分后信号更多:一个条数上限会把真发现挡在报告外面,提示词与收集端都不能再提它。
   const region = sourceRegion("你是代码评审员", "reproGuidance,");
-  assert(region.includes("${MAX_FINDINGS_PER_BATCH}"), "batch cap must be interpolated");
-  assert(!/最多\s*\d+\s*条/.test(region), "batch prompt must not hardcode a count");
+  assert(!/最多\s*\d+\s*条/.test(region) && !region.includes("MAX_FINDINGS_PER_BATCH"), "the batch prompt must not state a finding cap");
+  assert(!SOURCE.includes("MAX_FINDINGS_PER_BATCH"), "the collector must not cut findings by count");
   assert(!region.includes("补充 3 条"), "unobservable supplement cap must be gone");
 });
 
@@ -150,6 +151,41 @@ check("PROMPT:评审长负责合并且覆盖受代码校验", () => {
   assert(SOURCE.includes("评审长输出不完整"), "missing coverage fallback note");
   assert(SOURCE.includes("applyJudgeRanking"), "judge ranking must be validated in code");
   assert(sourceRegion("你负责去重与排序", "不要编辑任何文件。").includes("恰好出现一次"), "judge must account for every key");
+});
+
+check("PROMPT:评审长与全局评审员的输入只受模型上下文预算约束,没有条数或小字符上限", () => {
+  // 真机上评审长只收到 40/89 条:另外 49 条没进语义去重,同一根因在报告里出现两三遍;
+  // 全局评审员只看到 7 条已有发现,自己写明「另外 79 条未随摘要提供,无法逐条交叉去重」。
+  assert(!SOURCE.includes("MAX_JUDGE_INPUT_FINDINGS"), "the judge must not be capped by count");
+  const judgeInput = sourceRegion("const judgeInput: JudgeInputFinding[] = []", "const judgeInputCapped");
+  assert(judgeInput.includes("judgeChars + text.length > MODEL_INPUT_CHARS"), "the judge budget must be the shared model-input budget");
+  assert(!judgeInput.includes("clip("), "every finding must reach the judge whole");
+  assert(SOURCE.includes("Math.floor(MODEL_INPUT_CHARS / Math.max(1, scanResults.length))"), "the repo maps must use the same budget");
+  const dismissed = sourceRegion("const findingsDigest = digestFindings(ranked", "const globalResult = await globalReviewer.ask");
+  // 真机上批次写的是「判为误报」「误报(未进 findings)」:只认「误报判定」这个短语时,这一段发给全局评审员的是「无」。
+  assert(!dismissed.includes('includes("误报判定")'), "the dismissal filter must match what batch reviewers actually write");
+  // 筛选读的是批次的原始说明,不是拼上「仓库#批次: 」之后的字符串:反拆前缀在仓库名带「: 」时会切错。
+  assert(dismissed.includes("for (const { job, report } of batched)") && dismissed.includes("const body = String(note);") && dismissed.includes('if (!body.includes("误报"))'), "the dismissal filter must read the raw batch note as a string, not the prefixed line");
+  assert(dismissed.includes("MODEL_INPUT_CHARS - mapsText.length - findingsDigest.length"), "maps, digest and dismissal records must share one budget");
+});
+
+check("PROMPT:批次审查员与追踪员拿到全部信号与完整仓库地图", () => {
+  // 真机上:批次提示词每文件只展示前 12 条(6 条信号未送审),仓库地图截到 1500 字符(这次的地图有 1690)。
+  assert(!SOURCE.includes("MAX_SIGNALS_PER_") && !SOURCE.includes("clip(job.map"), "signals and the repo map must not be capped");
+  assert(SOURCE.split("仓库地图:\\n${job.map}").length - 1 === 2, "both the reviewer and the tracer must get the map whole");
+  assert(SOURCE.includes("packBatches(scan.groups, maxFilesPerBatch)"), "batches must be cut by file count only");
+  const packing = sourceRegion("function packBatches(", "function formatGroups(");
+  assert(!packing.includes("signalCount") && packing.includes("current.length >= maxFiles"), "no signal-count cut inside packBatches");
+  const signals = sourceRegion("function formatGroups(", 'return lines.join("\\n");\n}');
+  assert(!signals.includes("slice(") && !signals.includes("clip("), "no signal or criterion may be dropped in the batch prompt; the excerpt goes through excerptOf");
+  assert(!SOURCE.includes("未送审") && !SOURCE.includes("未展示"), "the withheld-signal notes must be gone with the caps");
+  // 规划员与修订员:这次运行的规则列表有 8558 字符,修订员被截到只看见 14 条里的 5 条,却要返回完整列表。
+  assert(!SOURCE.includes("clip(JSON.stringify("), "the planner and the reviser must see the whole selector list");
+  const planAsk = sourceRegion("function planPrompt(", "function revisionPrompt(");
+  assert(!planAsk.includes("clip("), "the previous rules, map and probe stats must reach the planner whole");
+  // 摘录只在拼提示词时缩短:信号去重的键含原始摘录,在汇总点缩短会把前 200 字符相同的两条命中并成一条。
+  assert(!sourceRegion("const decorated: Signal[] = rawHits.map", 'if (selector.kind === "scope")').includes("excerptOf("), "raw excerpts must keep their identity for deduplication");
+  assert(SOURCE.includes("${excerptOf(item.excerpt)}"), "the batch prompt shows the bounded preview");
 });
 
 check("PROMPT:接地比对压平空白", () => {
@@ -261,7 +297,6 @@ check("MODE:覆盖的维度按实际执行过的信号规则算", () => {
 check("PROMPT:字段注释里不再藏着第二个条数上限", () => {
   // 返回结构的字段说明会进子代理读到的 schema:一句「最多 12 条」就让评审员把已确认的发现挤进了 notCovered。
   assert(!/\/\*\*[^*]*最多 \d+ 条/.test(SOURCE), "a count in a field comment becomes a second cap the prompt never asked for");
-  assert(SOURCE.includes("每批次最多 ${MAX_FINDINGS_PER_BATCH} 条"), "the only batch cap is the interpolated constant");
 });
 
 check("PROMPT:规划员的能力清单列出每个工具", () => {
@@ -285,7 +320,7 @@ check("PROMPT:接地按省略号片段比对,全局评审员的摘要按整条�
   assert(grounding.includes("quoteFound(joined, snippet)") && grounding.includes("quoteFound(nearby, snippet)"), "grounding must accept abridged quotes");
   assert(grounding.includes(">= QUOTE_MIN_CHARS"), "quotes too short to mean anything must be ignored");
   const globalAsk = sourceRegion("已复核发现:", "批次已排除的信号");
-  assert(globalAsk.includes("${digestFindings(ranked, 4000)}") && !globalAsk.includes("clip(JSON.stringify("), "the digest must not be cut in the middle of a finding");
+  assert(SOURCE.includes("const findingsDigest = digestFindings(ranked, Math.max(0, MODEL_INPUT_CHARS - mapsText.length))") && globalAsk.includes("${findingsDigest}") && !globalAsk.includes("clip(JSON.stringify("), "the digest must not be cut in the middle of a finding");
 });
 
 check("GROUND:where 里有多个位置时取第一个「路径:行号」,读之前先 stat", () => {
@@ -1124,6 +1159,7 @@ const DECL_BLOCKS = [
   ["interface GraphInfo", "interface"],
   ["interface Hit", "interface"],
   ["interface Signal", "interface"],
+  ["interface SignalGroup", "interface"],
   ["interface SelectorRun", "interface"],
   ["interface SandboxRun", "interface"],
   ["interface SandboxOutcome", "interface"],
@@ -1186,6 +1222,10 @@ const FUNC_BLOCKS = [
   "stepLocations",
   "stepOverlap",
   "digestFindings",
+  "packBatches",
+  "formatGroups",
+  "selectorSignature",
+  "excerptOf",
   "normalizeSandboxRuns",
   "sandboxResult",
   "sandboxRevisionAsk",
@@ -1196,7 +1236,7 @@ const FUNC_BLOCKS = [
   "groundFinding",
   "quotedSnippets",
 ];
-const CONST_BLOCKS = ["RATIO_MIN", "RATIO_MAX", "MAX_REPRO", "MAX_FLOW_STEPS", "MAX_FLOWS_PER_REPO", "QUOTE_MIN_CHARS", "QUOTE_ELLIPSIS", "LOCATION_CITATION", "FLOW_SAME_OVERLAP", "SANDBOX_MAX_RUNS_PER_BATCH", "REPRO_IMAGE_TAG", "REPRO_IMAGE", "LOCATION_HEAD", "QUOTE_LINE_WINDOW", "SANDBOX_REQUEST_MAX_CHARS", "SOURCE_READ_MAX_BYTES"];
+const CONST_BLOCKS = ["RATIO_MIN", "RATIO_MAX", "MAX_REPRO", "MAX_FLOW_STEPS", "MAX_FLOWS_PER_REPO", "QUOTE_MIN_CHARS", "QUOTE_ELLIPSIS", "LOCATION_CITATION", "FLOW_SAME_OVERLAP", "SANDBOX_MAX_RUNS_PER_BATCH", "REPRO_IMAGE_TAG", "REPRO_IMAGE", "LOCATION_HEAD", "QUOTE_LINE_WINDOW", "SANDBOX_REQUEST_MAX_CHARS", "SOURCE_READ_MAX_BYTES", "EXCERPT_CHARS"];
 /** String.raw 常量,原样进入逻辑模块(模板里的 ${REDACT_SRC} 引用保持为引用)。 */
 const RAW_TEMPLATE_BLOCKS = ["REDACT_SRC", "SANDBOX_RUNNER_SRC", "READ_SOURCE_CODE"];
 
@@ -1325,7 +1365,7 @@ async function logicTests() {
     "const world = { run: async (cmd: string, args: string[], _options?: unknown): Promise<{ exitCode: number; stdout: string; stderr: string }> => { if (args[1] === READ_SOURCE_CODE) { readLog.push(args[3]); const text = virtualFiles.get(args[3]); return { exitCode: 0, stdout: JSON.stringify(text === undefined ? { ok: false, reason: 'ENOENT' } : { ok: true, text, truncated: false }), stderr: '' }; } throw new Error(`unexpected world.run ${cmd}`); } };",
   );
   for (const name of FUNC_BLOCKS) parts.push(extractFunction(name));
-  parts.push("export { severityAlias, squashForMatch, applyJudgeRanking, normalizeAssertion, normalizeRepro, classifyRepro, selectReproJobs, dedupeFindings, normalizeFinding, normalizeSelectors, resolveMode, selectorPathFor, dimensionLabel, slug, parseLocation, normalizeFlows, mermaidLabel, mermaidFlows, DIMENSIONS, SCAN_MODES, isGraphUnavailable, isTestPath, testReachHits, needsDependencyGraph, parseA11yOutput, relativeRepoPath, shortHash, quoteFound, quoteParts, citedLocations, nameKey, stepLocations, stepOverlap, FLOW_SAME_OVERLAP, digestFindings, firstErrorLine, normalizeSandboxRuns, sandboxResult, sandboxRevisionAsk, sandboxArgv, whereTarget, withRepo, groundFinding, SANDBOX_MAX_RUNS_PER_BATCH, REPRO_IMAGE, SANDBOX_RUNNER_SRC, virtualFiles, readLog };");
+  parts.push("export { severityAlias, squashForMatch, applyJudgeRanking, normalizeAssertion, normalizeRepro, classifyRepro, selectReproJobs, dedupeFindings, normalizeFinding, normalizeSelectors, resolveMode, selectorPathFor, dimensionLabel, slug, parseLocation, normalizeFlows, mermaidLabel, mermaidFlows, DIMENSIONS, SCAN_MODES, isGraphUnavailable, isTestPath, testReachHits, needsDependencyGraph, parseA11yOutput, relativeRepoPath, shortHash, quoteFound, quoteParts, citedLocations, nameKey, stepLocations, stepOverlap, FLOW_SAME_OVERLAP, digestFindings, packBatches, formatGroups, selectorSignature, excerptOf, EXCERPT_CHARS, firstErrorLine, normalizeSandboxRuns, sandboxResult, sandboxRevisionAsk, sandboxArgv, whereTarget, withRepo, groundFinding, SANDBOX_MAX_RUNS_PER_BATCH, REPRO_IMAGE, SANDBOX_RUNNER_SRC, virtualFiles, readLog };");
   const logicPath = path.join(workDir, "logic.ts");
   fs.writeFileSync(logicPath, parts.join("\n\n"));
   fs.writeFileSync(path.join(workDir, "package.json"), JSON.stringify({ type: "module" }));
@@ -1512,12 +1552,59 @@ async function logicTests() {
     assert(out.notes.some((note) => note.includes("合并重复项 1 条")), "merge note missing");
   });
 
-  check("LOGIC:评审长输出不完整退回确定性顺序", () => {
-    const checked = [mkChecked("f1"), mkChecked("f2")];
+  check("LOGIC:评审长输出不完整时,已返回的合并照用,漏掉的 key 原样保留", () => {
+    // 真机回放:91 条全量送入后评审长找全了 15 组重复,却漏回 1 个 key;
+    // 旧逻辑为此丢弃全部合并结果,报告里的重复一条没少。
+    const checked = [mkChecked("f1"), mkChecked("f2", "verified"), mkChecked("f3")];
     const ji = checked.map((finding) => mkInput(finding.key));
-    const out = logic.applyJudgeRanking([{ key: "f1" }], checked, ji, checked);
-    assert(out.ranked.length === 2, "no finding may be lost");
-    assert(out.notes.some((note) => note.includes("不完整")), "fallback note missing");
+    const out = logic.applyJudgeRanking([{ key: "f1", merged: ["f2"] }], checked, ji, checked);
+    assert(out.ranked.map((finding) => finding.key).join(",") === "f2,f3", `got ${out.ranked.map((finding) => finding.key).join(",")}`);
+    assert(out.notes.some((note) => note.includes("不完整") && note.includes("未返回的 1 条")), "incomplete note missing");
+  });
+
+  check("LOGIC:评审长的畸形输出不并掉没看过的发现,也不在畸形组里乱并", () => {
+    const three = [1, 2, 3].map((n) => mkChecked(`f${n}`));
+    // f3 没送出:评审长写了一个碰巧存在的 key,不能把没看过的发现并掉。
+    const unsent = logic.applyJudgeRanking([{ key: "f1", merged: ["f3"] }, { key: "f2" }], three, [mkInput("f1"), mkInput("f2")], three);
+    assert(unsent.ranked.map((f) => f.key).join(",") === "f1,f2,f3", `got ${unsent.ranked.map((f) => f.key).join(",")}`);
+    assert(unsent.notes.some((note) => note.includes("无效或重复")), "the unsent key must be counted as ignored");
+    // 保留项没送出:这个组不成立,那条只作为普通发现留在后面。
+    const unsentKeep = logic.applyJudgeRanking([{ key: "f3" }, { key: "f1" }, { key: "f2" }], three, [mkInput("f1"), mkInput("f2")], three);
+    assert(unsentKeep.ranked.map((f) => f.key).join(",") === "f1,f2,f3", `got ${unsentKeep.ranked.map((f) => f.key).join(",")}`);
+    // 跨仓库的发现不能并:另一个仓库里的同名问题是要分别改的另一处代码。
+    const other = { ...mkChecked("f3"), repo: "other" };
+    const cross = logic.applyJudgeRanking(
+      [{ key: "f1", merged: ["f3"] }, { key: "f2" }, { key: "f3" }],
+      [three[0], three[1], other],
+      three.map((finding) => mkInput(finding.key)),
+      [three[0], three[1], other],
+    );
+    assert(cross.ranked.map((f) => f.key).join(",") === "f1,f2,f3", `got ${cross.ranked.map((f) => f.key).join(",")}`);
+    // 同一个 key 在组里列两次:只并掉一条,计数也只算一条。
+    const twice = logic.applyJudgeRanking([{ key: "f1", merged: ["f2", "f2"] }, { key: "f3" }], three, three.map((finding) => mkInput(finding.key)), three);
+    assert(
+      twice.ranked.map((f) => f.key).join(",") === "f1,f3" && twice.notes.some((note) => note.includes("合并重复项 1 条")),
+      `got ${twice.ranked.map((f) => f.key).join(",")} / ${twice.notes.join(" | ")}`,
+    );
+    // 同一个保留项第二次出现:整组忽略,f3 与 f4 不能在组内互相合并。
+    const five = [1, 2, 3, 4, 5].map((n) => mkChecked(`f${n}`));
+    const all = five.map((finding) => mkInput(finding.key));
+    const repeated = logic.applyJudgeRanking([{ key: "f1", merged: ["f2"] }, { key: "f1", merged: ["f3", "f4"] }, { key: "f5" }], five, all, five);
+    assert(repeated.ranked.map((f) => f.key).join(",") === "f1,f5,f3,f4", `got ${repeated.ranked.map((f) => f.key).join(",")}`);
+    // 非空但没有可用 key:退回确定性顺序(已验证在前),不是原始批次顺序。
+    const mixed = [mkChecked("f1"), mkChecked("f2", "verified")];
+    const candidates = [mixed[1], mixed[0]];
+    const unusable = logic.applyJudgeRanking([{}], mixed, mixed.map((finding) => mkInput(finding.key)), candidates);
+    assert(unusable.ranked.map((f) => f.key).join(",") === "f2,f1", `got ${unusable.ranked.map((f) => f.key).join(",")}`);
+  });
+
+  check("LOGIC:合并重复项时被并入那条的复现规格跟着幸存者留下", () => {
+    const spec = { script: "s", assertion: { kind: "throws", match: "x" }, proves: "p" };
+    const base = { dimension: "quality", where: "a.js:1", problem: "p", evidence: "e", severity: "high", fix: "f", repo: "r", dir: ".", status: "verified", note: "n" };
+    const keep = { ...base, key: "k1" };
+    const merged = { ...base, key: "k2", repro: spec };
+    const out = logic.applyJudgeRanking([{ key: "k1", merged: ["k2"] }], [keep, merged], [mkInput("k1"), mkInput("k2")], [keep, merged]);
+    assert(out.ranked.length === 1 && out.ranked[0].key === "k1" && out.ranked[0].repro === spec, "the repro spec must survive the merge");
   });
 
   check("LOGIC:未知/重复 key 被忽略,未送出的按序追加", () => {
@@ -1782,6 +1869,39 @@ async function logicTests() {
     }
     const whole = logic.digestFindings([finding(1)], 4000);
     assert(whole.split("\n").length === 1 && !whole.includes("未列出"), "everything fits → no truncation note");
+    // 全局评审员的提示词共用一个预算:仓库地图占满时摘要一条也不能再放出去。
+    const none = logic.digestFindings([finding(1), finding(2)], 0);
+    assert(none.includes("另有 2 条未列出") && !none.includes("a1.js"), "a zero budget must list nothing");
+  });
+
+  check("LOGIC:批次只按文件数切分,提示词给出全部信号与完整判据", () => {
+    // 真机上批次提示词每文件只给前 12 条(这次就有 6 条信号未送审),每批超过 60 条信号就另起一批。
+    const group = (path, count) => ({
+      path,
+      items: Array.from({ length: count }, (_, i) => ({
+        path, line: i + 1, excerpt: `line ${i + 1} ${"x".repeat(150)}`, confidence: 0.5, provenance: "grep test",
+        selectorId: "s1", dimension: "quality", intent: "找空 catch", positive: "p".repeat(300), suppressor: "s".repeat(300),
+      })),
+    });
+    const groups = [group("a.js", 30), group("b.js", 20), group("c.js", 15)];
+    const batches = logic.packBatches(groups, 8);
+    assert(batches.length === 1 && batches[0].length === 3, `65 signals in three files must stay one batch, got ${batches.length}`);
+    const nine = Array.from({ length: 9 }, (_, i) => group(`f${i}.js`, 1));
+    assert(logic.packBatches(nine, 8).map((batch) => batch.length).join(",") === "8,1", "batches are cut by file count only");
+    const text = logic.formatGroups(groups, null);
+    assert((text.match(/line \d+ /g) ?? []).length === 65, "every signal must be listed");
+    assert(text.includes("x".repeat(150)) && text.includes("p".repeat(300)) && text.includes("s".repeat(300)), "excerpts and criteria must not be clipped");
+    assert(!text.includes("未展示"), "no withheld-signal marker");
+  });
+
+  check("LOGIC:摘录统一定义为单行预览;选择器签名含判据", () => {
+    // 循环依赖把整个环的文件列表塞进每条信号:以前靠提示词里 140 字符的截断挡着,现在由汇总点统一限长。
+    const cycle = `循环依赖: ${Array.from({ length: 300 }, (_, i) => `pkg/module${i}/file.go`).join(" → ")}`;
+    const excerpt = logic.excerptOf(cycle);
+    assert(excerpt.length <= logic.EXCERPT_CHARS + 1 && excerpt.endsWith("…"), `a cycle excerpt must stay a preview, got ${excerpt.length}`);
+    assert(!logic.excerptOf("catch (e) {\n  \n}").includes("\n"), "an excerpt is one line");
+    const base = { id: "s", kind: "grep", lang: "", query: "q", scope: "", target: "", exclude: "", intent: "i", positive: "p", suppressor: "u", dimension: "quality", budget: 0 };
+    assert(logic.selectorSignature(base) !== logic.selectorSignature({ ...base, suppressor: "u2" }), "a changed criterion must not reuse cached signals");
   });
 
   check("LOGIC:迁移文档的辅助函数 — 引用提取、流程名归一化、步骤包含", () => {

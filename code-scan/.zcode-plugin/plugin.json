@@ -1,6 +1,6 @@
 {
   "name": "code-scan",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "跨仓库全库扫描,扫描内容按模式选择(全面/性能/数据库查询/测试覆盖/死代码/代码质量/清理/遥测/无障碍/合规/迁移文档/安全/自定义),Devin Agentic MapReduce 复刻,选择器 v2 可持久化;按阶段模型可按人配置;Windows 下经 node 启动 npx-cli.js",
   "author": { "name": "Your team" },
   "skills": "./skills",

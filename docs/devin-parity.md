@@ -13,7 +13,7 @@
 | Selector 持久化 | 可审计、可版本控制、可复用 | `.code-scan/selectors/<repo>.json`（全面扫描）或 `<repo>~<模式>.json`：规则、地图、试跑统计；同模式、同 goal 复用 | 格式是本地 JSON，不是 Devin 的托管资产 |
 | Shard | 规则先在全库执行，命中产生 signal；有 signal 的文件切成 focused batches | 脚本确定性执行；只有信号文件进批次；按信号数/扇入/路径排序 | 分片粒度按文件数；预算外按路径采样 |
 | Map | 并行 Devin agents 调查批次，带 selector provenance | 每批一个独立上下文的审查员，信号带 selectorId/intent/行号 | 子 agent 数受 `max_concurrency` 与批次上限约束 |
-| Reduce | 聚合、去重、优先级排序 | 评审长去重 + 严重度排序（输入上限 120 条，合并对写入 notCovered） | 排序标准是 rubric，不是 Devin 的调优模型 |
+| Reduce | 聚合、去重、优先级排序 | 评审长去重 + 严重度排序（每条发现完整送入、不按条数设限，只受模型上下文预算约束；合并对写入 notCovered） | 排序标准是 rubric，不是 Devin 的调优模型 |
 | 扫描器接入 | 安全路径可 ingest Snyk/SonarQube/SARIF 等；非安全 Code Scans 公开文档未说明 | 非安全路径自带 knip/jscpd/madge/ast-grep/eslint jsx-a11y，无商业扫描器接入 | 未接 SARIF/Snyk 等 |
 | 证据 | 发现带可核查证据 | 每条必须给 `file:line` 或命令输出；性能必须有复杂度/基准证据；审查员可把验证命令交给沙箱，在隔离容器里执行并拿回真实输出（默认开启，需要 Docker）；可选 `runtimeVerify=true` 逐条跑复现脚本 | 不做 exploit 级验证 |
 | 复核 | 安全维度运行时验证可利用性；非安全类型官方未说明逐条验证 | 默认确定性接地；审查员提出的验证在容器沙箱里执行，结果只作证据补充、不改变 `verified` 的判定；runtimeVerify=true 时另有容器内运行时复现(最多 12 条) | 沙箱与复现都跑在容器里,不是 VM;沙箱输出由仓库代码自报;主机执行禁令是提示词约束,不是机制隔离 |
