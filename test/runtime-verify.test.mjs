@@ -110,6 +110,66 @@ function validLock(overrides = {}) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* 提示词契约:数字来自常量、条款可观测                                        */
+/* ------------------------------------------------------------------------- */
+
+function sourceRegion(startMarker, endMarker) {
+  const start = SOURCE.indexOf(startMarker);
+  if (start < 0) throw new Error(`missing ${startMarker}`);
+  const end = SOURCE.indexOf(endMarker, start);
+  if (end < 0) throw new Error(`missing ${endMarker} after ${startMarker}`);
+  return SOURCE.slice(start, end);
+}
+
+check("PROMPT:批次上限来自常量,没有第二个数字", () => {
+  const region = sourceRegion("你是代码评审员", "reproGuidance,");
+  assert(region.includes("${MAX_FINDINGS_PER_BATCH}"), "batch cap must be interpolated");
+  assert(!/最多\s*\d+\s*条/.test(region), "batch prompt must not hardcode a count");
+  assert(!region.includes("补充 3 条"), "unobservable supplement cap must be gone");
+});
+
+check("PROMPT:全局评审员的条数上限与 slice 共用一个常量", () => {
+  const region = sourceRegion("你负责跨批次模式审查", "不要编辑任何文件。");
+  assert(region.includes("${MAX_GLOBAL_FINDINGS}"), "global cap must be interpolated");
+  assert(SOURCE.includes("slice(0, MAX_GLOBAL_FINDINGS)"), "slice must use the constant");
+});
+
+check("PROMPT:评审长负责合并且覆盖受代码校验", () => {
+  assert(SOURCE.includes("评审长输出不完整"), "missing coverage fallback note");
+  assert(SOURCE.includes("applyJudgeRanking"), "judge ranking must be validated in code");
+  assert(sourceRegion("你负责去重与排序", "不要编辑任何文件。").includes("恰好出现一次"), "judge must account for every key");
+});
+
+check("PROMPT:接地比对压平空白", () => {
+  assert(SOURCE.includes("squashForMatch"), "grounding must normalize whitespace");
+});
+
+check("PROMPT:全局评审员重开需新事实并看到误报记录", () => {
+  assert(SOURCE.includes("重开依据"), "global reopen rule missing");
+  assert(SOURCE.includes("批次已排除的信号"), "dismissal records must reach the global reviewer");
+});
+
+check("PROMPT:复现契约与实际沙箱一致", () => {
+  assert(SOURCE.includes("不得写 /src 或 /deps"), "repro write ban must match mounts");
+  assert(!SOURCE.includes("读环境变量、改 process 全局"), "stale env ban must be gone");
+});
+
+check("PROMPT:规划员覆盖三个维度并要求抗重命名", () => {
+  assert(SOURCE.includes("规则要抗重命名"), "rename-resilience bullet missing");
+  assert(SOURCE.includes("三个维度(quality/dead-code/perf)都要有产生信号的规则覆盖"), "dimension coverage bullet missing");
+});
+
+check("PROMPT:命中判据进入 schema 并展示给审查员", () => {
+  assert(SOURCE.includes("positive: string;") && SOURCE.includes("suppressor: string;"), "selector criteria fields missing");
+  assert(SOURCE.includes("选择器意图与判据:"), "formatGroups must print criteria");
+  assert(SOURCE.includes("写不出具体判据就删掉这条规则"), "planner must delete vacuous rules");
+});
+
+check("PROMPT:维度缺口写进 notCovered", () => {
+  assert(SOURCE.includes("规划员没有产出这些维度的信号规则"), "coverage gap must be surfaced");
+});
+
+/* ------------------------------------------------------------------------- */
 /* 片段:base64 编码与字节上限                                                  */
 /* ------------------------------------------------------------------------- */
 
@@ -678,6 +738,9 @@ const DECL_BLOCKS = [
   ["interface ReproResult", "interface"],
   ["interface DockerCall", "interface"],
   ["interface ReproJob", "interface"],
+  ["interface JudgeFinding", "interface"],
+  ["interface JudgeInputFinding", "interface"],
+  ["interface JudgeRanking", "interface"],
 ];
 const FUNC_BLOCKS = [
   "clip",
@@ -688,6 +751,9 @@ const FUNC_BLOCKS = [
   "isSeverity",
   "isDimension",
   "findingKey",
+  "severityAlias",
+  "squashForMatch",
+  "applyJudgeRanking",
   "normalizeAssertion",
   "normalizeRepro",
   "classifyRepro",
@@ -797,7 +863,7 @@ async function logicTests() {
   for (const [marker, kind] of DECL_BLOCKS) parts.push(extractDecl(marker, kind));
   for (const name of CONST_BLOCKS) parts.push(extractConstLine(name));
   for (const name of FUNC_BLOCKS) parts.push(extractFunction(name));
-  parts.push("export { normalizeAssertion, normalizeRepro, classifyRepro, selectReproJobs, dedupeFindings, normalizeFinding };");
+  parts.push("export { severityAlias, squashForMatch, applyJudgeRanking, normalizeAssertion, normalizeRepro, classifyRepro, selectReproJobs, dedupeFindings, normalizeFinding };");
   const logicPath = path.join(workDir, "logic.ts");
   fs.writeFileSync(logicPath, parts.join("\n\n"));
   fs.writeFileSync(path.join(workDir, "package.json"), JSON.stringify({ type: "module" }));
@@ -954,14 +1020,56 @@ async function logicTests() {
     assert(notes.some((note) => /复现规格无效/.test(note)), "note recorded");
   });
 
-  check("LOGIC:未知 severity/dimension 回落但不丢发现", () => {
+  check("LOGIC:同义 severity 收敛;真正未知的才回落", () => {
     const notes = [];
-    const out = logic.normalizeFinding(
+    const mapped = logic.normalizeFinding(
       { dimension: "security", where: "a.js:1", problem: "p", evidence: "e", severity: "critical", fix: "f" },
       notes,
     );
-    assert(out !== null, "finding kept");
-    assert(out.severity === "medium" && out.dimension === "quality", `${out.severity}/${out.dimension}`);
+    assert(mapped !== null, "finding kept");
+    assert(mapped.severity === "high" && mapped.dimension === "quality", `${mapped.severity}/${mapped.dimension}`);
+    const unknown = logic.normalizeFinding({ where: "a.js:1", problem: "p", severity: "banana" }, notes);
+    assert(unknown !== null && unknown.severity === "medium", "unknown severity falls back to medium");
+    assert(notes.some((note) => note.includes("严重度无法识别")), "unknown severity is noted");
+  });
+
+  const mkChecked = (key, status = "unconfirmed") => ({
+    dimension: "quality", where: "a.js:1", problem: "p" + key, evidence: "e", severity: "low", fix: "f",
+    repo: "r", dir: ".", key, status, note: "n",
+  });
+  const mkInput = (key) => ({ key, repo: "r", where: "a.js:1", problem: "p", evidence: "e", severity: "low", status: "unconfirmed" });
+
+  check("LOGIC:评审长合并重复项,已验证者当幸存者", () => {
+    const checked = [mkChecked("f1"), mkChecked("f2", "verified"), mkChecked("f3")];
+    const ji = checked.map((finding) => mkInput(finding.key));
+    const out = logic.applyJudgeRanking([{ key: "f1", merged: ["f2"] }, { key: "f3" }], checked, ji, checked);
+    assert(out.ranked.length === 2, `expected 2, got ${out.ranked.length}`);
+    assert(out.ranked[0].key === "f2", "verified survivor wins the group");
+    assert(out.notes.some((note) => note.includes("合并重复项 1 条")), "merge note missing");
+  });
+
+  check("LOGIC:评审长输出不完整退回确定性顺序", () => {
+    const checked = [mkChecked("f1"), mkChecked("f2")];
+    const ji = checked.map((finding) => mkInput(finding.key));
+    const out = logic.applyJudgeRanking([{ key: "f1" }], checked, ji, checked);
+    assert(out.ranked.length === 2, "no finding may be lost");
+    assert(out.notes.some((note) => note.includes("不完整")), "fallback note missing");
+  });
+
+  check("LOGIC:未知/重复 key 被忽略,未送出的按序追加", () => {
+    const checked = [mkChecked("f1"), mkChecked("f2"), mkChecked("f3")];
+    const ji = [mkInput("f1"), mkInput("f2")];
+    const out = logic.applyJudgeRanking([{ key: "f2" }, { key: "f2" }, { key: "zz" }, { key: "f1" }], checked, ji, checked);
+    assert(out.ranked.map((finding) => finding.key).join(",") === "f2,f1,f3", `got ${out.ranked.map((finding) => finding.key).join(",")}`);
+    assert(out.notes.some((note) => note.includes("无效或重复")), "ignored note missing");
+    assert(out.notes.some((note) => note.includes("未覆盖 1 条")), "unsent note missing");
+  });
+
+  check("LOGIC:压扁的多行引用能匹配原文", () => {
+    const fileText = ["function pageSize(items, size) {", "  const pages = [];", "  for (let i = 0; i <= items.length; i += size) {", "    pages.push(items.slice(i, i + size));", "  }", "  return pages;", "}"].join("\n");
+    const quote = "function pageSize(items, size) { const pages = []; for (let i = 0; i <= items.length; i += size) { pages.push(items.slice(i, i + size)); } return pages; }";
+    assert(logic.squashForMatch(fileText).includes(logic.squashForMatch(quote)), "squashed quote must match squashed file");
+    assert(logic.squashForMatch("a  b\n\nc\t d") === "a b c d", "whitespace collapses to single spaces");
   });
 }
 

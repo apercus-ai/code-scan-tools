@@ -88,6 +88,10 @@ interface SelectorSpec {
   exclude: string;
   /** 这条规则要回答的问题,会带给批次审查员与复核员。 */
   intent: string;
+  /** 命中长什么样才算真信号;空字符串表示未提供。 */
+  positive: string;
+  /** 命中但属于正常写法的情况;空字符串表示未提供。 */
+  suppressor: string;
   /** 维度侧重。 */
   dimension: "quality" | "dead-code" | "perf";
   /** 命中上限;0 表示使用本次运行的默认预算。 */
@@ -171,6 +175,10 @@ interface Signal extends Hit {
   dimension: "quality" | "dead-code" | "perf";
   /** 产生信号的规则类型。 */
   kind: string;
+  /** 该规则的命中判据;空字符串表示未提供。 */
+  positive: string;
+  /** 该规则的排除判据;空字符串表示未提供。 */
+  suppressor: string;
 }
 
 interface ToolOutcome {
@@ -343,8 +351,10 @@ interface JudgeInputFinding {
 }
 
 interface JudgeFinding {
-  /** 已复核发现的稳定键;评审长按顺序返回。 */
+  /** 组内保留项的稳定键;评审长按组返回。 */
   key: string;
+  /** 并入这一组的其他发现 key;没有合并时省略。 */
+  merged?: string[];
   /** 以下字段允许评审长原样带回,但脚本只读取 key,不会用它们覆盖可信字段。 */
   repo?: string;
   where?: string;
@@ -459,8 +469,10 @@ const MAX_MANIFEST_CHARS = 24000;
 const MAX_REPORT_CHARS = 60000;
 const MAX_JUDGE_INPUT_FINDINGS = 120;
 const MAX_JUDGE_INPUT_CHARS = 24000;
-/** 单批次发现硬上限;只防审查员病态输出(几十条重复/碎片),正常批次远达不到。 */
+/** 单批次发现硬上限;提示词与截断判断共用这一个值,改这里就同时改提示词。 */
 const MAX_FINDINGS_PER_BATCH = 50;
+/** 全局评审员新增发现的上限;提示词与 slice 共用这一个值。 */
+const MAX_GLOBAL_FINDINGS = 5;
 /** 报告与返回值的展示上限;超出的写进 notCovered 并说明,不静默丢弃。 */
 const MAX_FINDINGS_REPORTED = 200;
 /** 证据原文在引用行附近多少行内出现,仍算「就是这一行」。 */
@@ -1639,18 +1651,28 @@ function packBatches(groups: SignalGroup[], maxFiles: number, maxSignals: number
 /** 把批次信号压成提示词文本;每文件最多展示 MAX_SIGNALS_PER_FILE 条。 */
 function formatGroups(groups: SignalGroup[], fanIn: Map<string, number> | null): string {
   const lines: string[] = [];
-  const intents = new Map<string, string>();
+  const intents = new Map<string, { intent: string; positive: string; suppressor: string }>();
   for (const group of groups) {
     for (const item of group.items) {
       if (!intents.has(item.selectorId)) {
-        intents.set(item.selectorId, item.intent);
+        intents.set(item.selectorId, {
+          intent: item.intent,
+          positive: item.positive,
+          suppressor: item.suppressor,
+        });
       }
     }
   }
   if (intents.size > 0) {
-    lines.push("选择器意图:");
-    for (const [id, intent] of intents) {
-      lines.push(`- ${id}: ${clip(intent, 120)}`);
+    lines.push("选择器意图与判据:");
+    for (const [id, rule] of intents) {
+      lines.push(`- ${id}: ${clip(rule.intent, 120)}`);
+      if (rule.positive !== "") {
+        lines.push(`  期望: ${clip(rule.positive, 200)}`);
+      }
+      if (rule.suppressor !== "") {
+        lines.push(`  排除: ${clip(rule.suppressor, 200)}`);
+      }
     }
     lines.push("信号:");
   }
@@ -1756,6 +1778,26 @@ function isSeverity(value: string): value is "high" | "medium" | "low" {
  * 字段是模型输出,不能让未知 severity/dimension 混进排序、统计与看板分列。
  * 返回 null 表示缺少位置或问题描述,调用方记 notCovered。
  */
+/** 常见同义等级收敛到三档;表外的才算无法识别。 */
+function severityAlias(value: string): RawFinding["severity"] | null {
+  switch (value) {
+    case "critical":
+    case "blocker":
+    case "severe":
+      return "high";
+    case "major":
+    case "moderate":
+    case "normal":
+      return "medium";
+    case "minor":
+    case "trivial":
+    case "info":
+      return "low";
+    default:
+      return null;
+  }
+}
+
 function normalizeFinding(raw: unknown, notes: string[]): RawFinding | null {
   if (!isRecord(raw)) {
     notes.push("丢弃一条无法解析的发现(不是对象)");
@@ -1772,7 +1814,12 @@ function normalizeFinding(raw: unknown, notes: string[]): RawFinding | null {
   if (isSeverity(rawSeverity)) {
     severity = rawSeverity;
   } else {
-    notes.push(`发现严重度无法识别(${clip(rawSeverity, 40) || "空"}),按 medium 处理: ${where}`);
+    const alias = severityAlias(rawSeverity);
+    if (alias !== null) {
+      severity = alias;
+    } else {
+      notes.push(`发现严重度无法识别(${clip(rawSeverity, 40) || "空"}),按 medium 处理: ${where}`);
+    }
   }
   const rawDimension = asString(raw.dimension).trim().toLowerCase();
   let dimension: RawFinding["dimension"] = "quality";
@@ -1841,6 +1888,11 @@ function parseWhere(where: string): { path: string; line: number } {
   return { path: match[1].trim(), line: Number.isFinite(line) && line > 0 ? line : 0 };
 }
 
+/** 把空白压成单个空格:审查员常把多行代码压成一行引用,按原文精确比对会误判不存在。 */
+function squashForMatch(textValue: string): string {
+  return textValue.replace(/\s+/g, " ").trim();
+}
+
 /** 从证据里取出被反引号包住的代码片段;没有反引号就取带引号的串。 */
 function quotedSnippets(evidence: string): string[] {
   const snippets: string[] = [];
@@ -1881,6 +1933,98 @@ function evidenceIdentifiers(evidence: string): string[] {
  * 但只能证明「引用的代码确实存在」,不能证明「这行代码真的有问题」——后者留给读者判断,
  * 报告里用 status 区分。
  */
+interface JudgeRanking {
+  /** 合并后的排序结果。 */
+  ranked: CheckedFinding[];
+  /** 合并与兜底的说明,进 notCovered。 */
+  notes: string[];
+}
+
+/**
+ * 应用评审长的去重与排序。
+ * 校验规则:每个送出的 key(作为保留或被并入)必须恰好出现一次;
+ * 未知或重复的 key 忽略并计数;输出不完整就整体退回确定性顺序,绝不丢发现。
+ */
+function applyJudgeRanking(
+  judgeItems: unknown,
+  checked: CheckedFinding[],
+  judgeInput: JudgeInputFinding[],
+  judgeCandidates: CheckedFinding[],
+): JudgeRanking {
+  const items = Array.isArray(judgeItems) ? judgeItems : [];
+  const checkedByKey = new Map(checked.map((finding) => [finding.key, finding]));
+  const inputKeys = new Set(judgeInput.map((finding) => finding.key));
+  const seen = new Set<string>();
+  const ordered: CheckedFinding[] = [];
+  const mergePairs: string[] = [];
+  let ignored = 0;
+  for (const item of items) {
+    if (!isRecord(item)) {
+      ignored += 1;
+      continue;
+    }
+    const keepKey = typeof item.key === "string" ? item.key : "";
+    const keep = checkedByKey.get(keepKey);
+    if (keep === undefined) {
+      ignored += 1;
+      continue;
+    }
+    const group: CheckedFinding[] = [keep];
+    if (Array.isArray(item.merged)) {
+      for (const raw of item.merged) {
+        const mergedKey = typeof raw === "string" ? raw : "";
+        const mergedFinding = checkedByKey.get(mergedKey);
+        if (mergedFinding === undefined || mergedKey === keepKey) {
+          ignored += 1;
+          continue;
+        }
+        group.push(mergedFinding);
+      }
+    }
+    const fresh = group.filter((finding) => !seen.has(finding.key));
+    ignored += group.length - fresh.length;
+    if (fresh.length === 0) {
+      continue;
+    }
+    // 组内已验证的那条证据更硬,优先当幸存者;评审长指定的 keep 只是默认。
+    const survivor = fresh.find((finding) => finding.status === "verified") ?? fresh[0];
+    for (const finding of fresh) {
+      seen.add(finding.key);
+      if (finding.key !== survivor.key) {
+        mergePairs.push(`${finding.key}并入${survivor.key}`);
+      }
+    }
+    ordered.push(survivor);
+  }
+  const notes: string[] = [];
+  if (items.length === 0) {
+    if (checked.length > 0) {
+      notes.push("评审长未返回可解析的 key 列表,按确定性顺序输出全部发现");
+    }
+    return { ranked: judgeCandidates, notes };
+  }
+  const missing = judgeInput.filter((finding) => !seen.has(finding.key));
+  if (missing.length > 0) {
+    // 送出但未返回:可能是截断,也可能是模型自作主张丢条,都不允许丢发现。
+    notes.push(
+      `评审长输出不完整(覆盖 ${judgeInput.length - missing.length}/${judgeInput.length} 个 key),已忽略其结果并按确定性顺序输出`,
+    );
+    return { ranked: judgeCandidates, notes };
+  }
+  if (ignored > 0) {
+    notes.push(`评审长返回 ${ignored} 个无效或重复 key,已忽略`);
+  }
+  if (mergePairs.length > 0) {
+    const shown = mergePairs.slice(0, 12).join("; ");
+    notes.push(`评审长合并重复项 ${mergePairs.length} 条: ${clip(shown, 300)}${mergePairs.length > 12 ? " 等" : ""}`);
+  }
+  const unsent = checked.filter((finding) => !inputKeys.has(finding.key));
+  if (unsent.length > 0) {
+    notes.push(`评审长输入未覆盖 ${unsent.length} 条,按复核顺序追加`);
+  }
+  return { ranked: ordered.concat(unsent), notes };
+}
+
 async function groundFinding(finding: Finding): Promise<GroundingResult> {
   const target = parseWhere(finding.where);
   if (target.path === "") {
@@ -1912,8 +2056,8 @@ async function groundFinding(finding: Finding): Promise<GroundingResult> {
       reason: `文件与行号存在(${target.path}:${target.line}),但证据未引用可核对原文`,
     };
   }
-  const joined = lines.join("\n");
-  const missing = snippets.filter((snippet) => !joined.includes(snippet));
+  const joined = squashForMatch(lines.join("\n"));
+  const missing = snippets.filter((snippet) => !joined.includes(squashForMatch(snippet)));
   if (missing.length === snippets.length) {
     return {
       holds: false,
@@ -1923,8 +2067,9 @@ async function groundFinding(finding: Finding): Promise<GroundingResult> {
   if (target.line > 0) {
     const start = Math.max(0, target.line - 1 - QUOTE_LINE_WINDOW);
     const end = Math.min(lines.length, target.line + QUOTE_LINE_WINDOW);
-    const nearby = lines.slice(start, end).join("\n");
-    if (!snippets.some((snippet) => nearby.includes(snippet))) {
+    const nearby = squashForMatch(lines.slice(start, end).join("\n"));
+    // 压成一行引用时,整段比对会超出窗口;锚定开头 24 个非空白字符即可。
+    if (!snippets.some((snippet) => nearby.includes(squashForMatch(snippet).slice(0, 24)))) {
       return {
         holds: false,
         reason: `引用片段不在 ${target.path}:${target.line} 附近;证据与行号不符`,
@@ -2938,7 +3083,9 @@ function normalizeSelectors(raw: unknown, caps: Capabilities, notes: string[]): 
     const target = asString(item.target).trim();
     const exclude = asString(item.exclude).trim();
     const intentValue = asString(item.intent).trim();
-    const safeFields = [query, scope, target, exclude, intentValue, lang];
+    const positiveValue = clip(oneLine(asString(item.positive).trim()), 200);
+    const suppressorValue = clip(oneLine(asString(item.suppressor).trim()), 200);
+    const safeFields = [query, scope, target, exclude, intentValue, positiveValue, suppressorValue, lang];
     if (!safeFields.every((value) => isSafeSelectorText(value))) {
       notes.push(`丢弃含控制字符或以 - 开头的选择器: ${noteId}`);
       continue;
@@ -2987,6 +3134,8 @@ function normalizeSelectors(raw: unknown, caps: Capabilities, notes: string[]): 
       target,
       exclude,
       intent: intentValue !== "" ? intentValue : query,
+      positive: positiveValue,
+      suppressor: suppressorValue,
       dimension: dimension as SelectorSpec["dimension"],
       budget: asNumber(item.budget),
     });
@@ -3068,6 +3217,19 @@ function loadSelectorManifest(text: string, caps: Capabilities, notes: string[])
 
 /** 读取存档;不存在或不可解析时返回 null。 */
 async function readSelectorManifest(path: string, caps: Capabilities, notes: string[]): Promise<LoadedManifest | null> {
+  // 首次运行时存档还不存在;先 stat 再读,避免在时间线里留下一次「读取失败」的红步骤。
+  let present = true;
+  try {
+    const presence = await fsPresence([path]);
+    if (presence !== null) {
+      present = presence[0] === true;
+    }
+  } catch {
+    present = true;
+  }
+  if (!present) {
+    return null;
+  }
   try {
     const text = await files.read(path);
     return loadSelectorManifest(text, caps, notes);
@@ -3545,6 +3707,7 @@ async function runKnip(ctx: RepoContext): Promise<ToolOutcome> {
         configPath,
         "--directory",
         ctx.repo.dir,
+        "--no-exit-code",
         "--reporter",
         "json",
       ],
@@ -3898,6 +4061,8 @@ async function executeSelector(ctx: RepoContext, selector: SelectorSpec): Promis
     ...hit,
     selectorId: selector.id,
     intent: selector.intent,
+    positive: selector.positive,
+    suppressor: selector.suppressor,
     dimension: selector.dimension,
     kind: selector.kind,
   }));
@@ -3963,8 +4128,14 @@ function planPrompt(
     ? `\n上次运行的 selectors(可复用,也可按仓库现状修订):\n${clip(JSON.stringify(previous), 3000)}\n上次地图:${clip(previousMap, 800)}\n上次试跑:\n${probeLines.join("\n")}`
     : "";
   return `研究仓库目录 ${repo.dir}(仓库名 ${repo.name})。扫描侧重:${goal}。\n能力:${capabilityLine}。能力说明:${caps.notes.join(";") || "无"}${previousText}\n\n历史规则与上次地图已在上面的提示中给出;不要读取 .code-scan/selectors/*.json 或不存在的文件;需要探索仓库时用 Grep/Glob。
-只返回作用于全库的确定性选择规则,不要返回文件清单。每条 selector 字段如下(全部必填,不适用的填 ""):\n{ id, kind, lang, query, scope, target, exclude, intent, dimension, budget }\n\n规则类型:\n- kind=scope:query 是路径 glob(如 "src/**/*.ts"),只圈定审查边界,不产生信号;至少 1 条。\n- kind=grep:query 是 ripgrep 正则(不支持 lookahead/lookbehind/反向引用,写了会直接报错),scope 是路径 glob(空=全仓库),命中行成为信号。\n- kind=ast:query 是 ast-grep AST 模式(如 "catch ($ERR) { }"、"$ARR.forEach(async ($X) => { $$$ })"),lang 取 ts|tsx|js|jsx|py|go|rust|java,scope 是路径 glob。若需要关系查询,query 可以是 ast-grep 规则 JSON(如 {"rule":{"all":[{"pattern":"..."},{"inside":{"kind":"function_declaration"}}]}})。\n- kind=graph:query 取 cycle|orphan|layering;cycle 用 scope 过滤环中文件;orphan 用 scope 圈候选、target 填入口豁免 glob(逗号分隔);layering 用 scope 填来源 glob、target 填禁止依赖的目标 glob(逗号分隔)。\n- kind=tool:query 取 knip|jscpd,分别报未使用导出/依赖与重复代码。\n\n约束:\n- id 用 ASCII,稳定且唯一(重跑会复用同 id 的规则)。\n- 规则数量:scope 2–3 条,产生信号的规则合计 8–12 条。每条 grep 都是一次全库检索,规则越多成本越高;覆盖不到的边角写进 skipped,不要靠堆规则。\n- scope 规则只圈范围;产生信号的规则至少各 1 条,否则分片没有依据。\n- **单条 grep 命中必须低于 2000 行**:grep 超过 2000 行是直接报错而不是截断,budget 管不到这种情形。预计命中接近这个量级时,收窄 scope 或换更精确的正则;拿不准就先用窄 scope。\n- budget 是单条规则命中上限(默认 ${defaultSelectorBudget},最大 2000);预计命中很多时收窄 scope 或换更精确的 query,而不是靠采样。
-- dimension 取 quality|dead-code|perf。\n- exclude 是逗号分隔的路径 glob,可排除测试/生成物。\n- intent 用一句中文写清这条规则要找什么,会带给批次审查员。\n- 只使用能力为 true 的类型;不可用的类型不要写。\n\n返回 selectors、map(≤1500 字的仓库地图:模块树、职责、入口、关键依赖边)与 skipped(有意跳过的目录与理由)。`;
+只返回作用于全库的确定性选择规则,不要返回文件清单。每条 selector 字段如下(全部必填,不适用的填 ""):\n{ id, kind, lang, query, scope, target, exclude, intent, positive, suppressor, dimension, budget }\n\n规则类型:\n- kind=scope:query 是路径 glob(如 "src/**/*.ts"),只圈定审查边界,不产生信号;至少 1 条。\n- kind=grep:query 是 ripgrep 正则(不支持 lookahead/lookbehind/反向引用,写了会直接报错),scope 是路径 glob(空=全仓库),命中行成为信号。\n- kind=ast:query 是 ast-grep AST 模式(如 "catch ($ERR) { }"、"$ARR.forEach(async ($X) => { $$$ })"),lang 取 ts|tsx|js|jsx|py|go|rust|java,scope 是路径 glob。若需要关系查询,query 可以是 ast-grep 规则 JSON(如 {"rule":{"all":[{"pattern":"..."},{"inside":{"kind":"function_declaration"}}]}})。\n- kind=graph:query 取 cycle|orphan|layering;cycle 用 scope 过滤环中文件;orphan 用 scope 圈候选、target 填入口豁免 glob(逗号分隔);layering 用 scope 填来源 glob、target 填禁止依赖的目标 glob(逗号分隔)。\n- kind=tool:query 取 knip|jscpd,分别报未使用导出/依赖与重复代码。\n\n约束:\n- id 用 ASCII,稳定且唯一(重跑会复用同 id 的规则)。\n- 规则数量:scope 2–3 条,产生信号的规则合计 8–12 条。每条 grep 都是一次全库检索,规则越多成本越高;覆盖不到的边角写进 skipped,不要靠堆规则。\n- scope 规则只圈范围;产生信号的规则至少各 1 条,否则分片没有依据。\n- **单条 grep 命中必须低于 2000 行**:grep 超过 2000 行是直接报错而不是截断,budget 管不到这种情形。预计命中接近这个量级时,收窄 scope 或换更精确的正则;拿不准就先用窄 scope。\n- budget 是单条规则命中上限(默认 ${defaultSelectorBudget},最大 2000);预计命中很多时收窄 scope 或换更精确的 query,而不是靠采样。
+- intent 用一句中文写清这条规则要找什么,会带给批次审查员。
+- 每条产生信号的规则都要写 positive(命中长什么样才算真信号)与 suppressor(命中了但属于正常写法的情况);写不出具体判据就删掉这条规则,不要留空话。
+- dimension 取 quality|dead-code|perf。
+- exclude 是逗号分隔的路径 glob,可排除测试/生成物。
+- 三个维度(quality/dead-code/perf)都要有产生信号的规则覆盖;某个维度确实没有可扫目标时,在 skipped 写明原因。
+- 规则要抗重命名:锚定结构或语义(调用形态、导入关系、导出位置、异常处理形状),不要只匹配某个具体变量名或文案。
+- 只使用能力为 true 的类型;不可用的类型不要写。\n\n返回 selectors、map(≤1500 字的仓库地图:模块树、职责、入口、关键依赖边)与 skipped(有意跳过的目录与理由)。`;
 }
 
 /** 为修订员准备提示词。 */
@@ -4138,7 +4309,7 @@ const npmToolsShadowed =
 // 运行时复现能力探测:只做一次,结果复用。失败就整段停用,原因写进 notCovered。
 const runtimeProbe = await detectRuntimeVerify();
 const reproGuidance = runtimeProbe.ok
-  ? "若能设计一段可执行复现,额外返回 repro 字段 {script,assertion,proves}。script 是 CommonJS,必须 module.exports = { run };导入仓库代码只能用 createRequire('/src/package.json')(裸 require 会从 /work 解析而失败)。脚本不得写文件、联网、读环境变量、改 process 全局,且不超过 8KB。assertion 三选一:{kind:'throws',match} / {kind:'not-equals',expected} / {kind:'ratio-greater',threshold}(threshold 在 2.5–100,run() 返回 t1Ms/t2Ms 且 t1Ms≥50)。拿不准就不要给 repro。"
+  ? "若能设计一段可执行复现,额外返回 repro 字段 {script,assertion,proves}。script 是 CommonJS,必须 module.exports = { run };导入仓库代码只能用 createRequire('/src/package.json')(裸 require 会从 /work 解析而失败)。脚本必须可离线执行:不得联网,不得写 /src 或 /deps(容器已只读挂载),可以写 /tmp 但随容器销毁、不要依赖;不要用环境变量作为输入(子进程只有 PATH/HOME/TMPDIR/NODE_PATH),不要改 process 全局;脚本不超过 8KB。assertion 三选一:{kind:'throws',match} / {kind:'not-equals',expected} / {kind:'ratio-greater',threshold}(threshold 在 2.5–100,run() 返回 t1Ms/t2Ms 且 t1Ms≥50)。拿不准就不要给 repro。"
   : "";
 const knipConfigPath =
   workspaceRoot !== "" ? `${workspaceRoot}/.code-scan/tmp/knip-empty.json` : "";
@@ -4307,6 +4478,13 @@ const planned = await Promise.all(
         ? plan.skipped.filter((note): note is string => typeof note === "string")
         : planSkipped;
       selectors = normalizeSelectors(plan.selectors, caps, planningNotes);
+    }
+    const dimensionTargets: Array<SelectorSpec["dimension"]> = ["quality", "dead-code", "perf"];
+    const missingDimensions = dimensionTargets.filter(
+      (dim) => !selectors.some((selector) => selector.kind !== "scope" && selector.dimension === dim),
+    );
+    if (missingDimensions.length > 0) {
+      planningNotes.push(`规划员没有产出这些维度的信号规则: ${missingDimensions.join(", ")}`);
     }
     const preserve = manifest !== null && manifest.goalMatches && !refreshSelectors;
     const preserved = preserve && manifest !== null ? manifest.filteredSelectors : [];
@@ -4632,7 +4810,26 @@ const batched = await Promise.all(
     const report = await agent(
       `审查员-${job.repoIndex + 1}-${job.repo.name}-${job.index + 1}`,
       {
-        system: "你是资深代码评审。输入是全库选择器信号与工具候选,已带 provenance;逐条复核它们是否真是问题,可在仓库目录内 Grep 全局补充上下文,不要只看命中文件。只报你确信的问题;证据必须来自你实际读过的行或实际运行过的命令。不要编辑任何文件。每批次最多 12 条发现;信号之外最多补充 3 条。维度只有 quality/dead-code/perf 三类,安全类问题不要报(没有 security 维度)。severity 只能是 high、medium 或 low,high 仅用于数据丢失、崩溃或错误结果。where 必须是相对仓库根目录的 `路径:行号`。信号没覆盖到、或你无法判断的部分写进 notCovered 并说明原因,不要留空。" + reproGuidance,
+        system:
+          `你是代码评审员:把全库信号逐条判成真问题或误报。信号已带 provenance;可在仓库目录内 Grep 全局补充上下文,不要只看命中文件。
+
+证据契约,缺一项就把这条写成 notCovered:
+- problem 必须点名具体符号(函数/类/导出/配置项),不能只描述现象;
+- evidence 必须是命中文件里的原文片段,不能是转述;
+- evidence 里另写一句排除检查:你为排除误报查了什么(调用点、测试引用、动态或反射引用、是否公开 API、是否生成物);
+- where 必须是相对仓库根目录的「路径:行号」;
+- 信号带「期望/排除」时,它们就是这条规则的命中判据:不符合期望、或符合排除的,不报。
+
+维度只有三个,不属于任何一个的写进 notCovered:
+- quality:错误处理缺失或吞掉、边界条件错、资源未释放、状态不一致、契约被破坏。
+- dead-code:零引用、仅测试引用、仅导出无外部消费者,三种分开写;不可达代码单独给理由。
+- perf:必须给复杂度论证(输入规模如何放大)或基准数据(耗时/比值);只凭看起来慢不算。
+
+severity 只有 high/medium/low:high 用于数据丢失、崩溃或错误结果;medium 用于可观测的正确性风险或热点路径上的明显退化;low 用于不影响行为的整洁度问题。拿不准取低一档,并在 evidence 写明不确定点。
+
+每批次最多 ${MAX_FINDINGS_PER_BATCH} 条,这是防病态输出的硬上限,不是凑数目标。信号之外的补充发现必须写明哪条信号漏掉了它、为什么;没有这句不报。同批次同根因的合并成一条:where 用最具体的一处,其余位置写进 evidence。
+
+不要编辑任何文件。信号没覆盖到、或你无法判断的部分写进 notCovered 并说明原因,不要留空。` + reproGuidance,
         /* @model:review */
       },
     ).ask<BatchReport>(
@@ -4713,7 +4910,7 @@ phase("汇总:去重排序");
 const judge = agent(
   "评审长",
   {
-    system: "你只负责合并重复项并排序:合并同一仓库同一位置同一问题的重复项,按严重度与影响面排序,最多保留 60 个 key;只返回 key,不要改写其他字段,不要编辑任何文件。",
+    system: "你负责去重与排序:把同一仓库同一位置同一根因、只是措辞不同的重复项分到一组,每组保留证据最完整或已验证的那条;再按严重度与影响面排序。每个收到的 key(作为保留或被并入)必须恰好出现一次,不增不删不改名;不要改写其他字段,不要编辑任何文件。",
     /* @model:judge */
   },
 );
@@ -4748,52 +4945,22 @@ for (const finding of judgeCandidates) {
 }
 const judgeInputCapped = judgeInput.length < checked.length;
 const judgeResult = await judge.ask<JudgeFinding[]>(
-  `去重并排序这些已复核发现,返回对象只保留 key:\n${JSON.stringify(judgeInput)}`,
+  `先合并重复项,再按严重度与影响面排序这些已复核发现。同一仓库同一位置同一根因、只是措辞不同的合成一组:返回 {key: 保留项, merged: [被并入的 key]},保留证据更完整或已验证(status=verified)的那条;每个收到的 key(作为保留或被并入)必须恰好出现一次,不增不漏不改名。按严重度与影响面给保留项排序:
+${JSON.stringify(judgeInput)}`,
 );
-const judgeItems = Array.isArray(judgeResult) ? judgeResult : [];
-const checkedByKey = new Map(checked.map((finding) => [finding.key, finding]));
-const rankedKeys: CheckedFinding[] = [];
-const seenJudgeKeys = new Set<string>();
-for (const item of judgeItems) {
-  if (!isRecord(item) || typeof item.key !== "string") {
-    continue;
-  }
-  const trusted = checkedByKey.get(item.key);
-  if (trusted === undefined || seenJudgeKeys.has(trusted.key)) {
-    continue;
-  }
-  seenJudgeKeys.add(trusted.key);
-  rankedKeys.push(trusted);
-}
-const judgeInputKeys = new Set(judgeInput.map((finding) => finding.key));
-const judgeNotes: string[] = [];
-let ranked: CheckedFinding[] = checked;
+const { ranked, notes: judgeNotes } = applyJudgeRanking(judgeResult, checked, judgeInput, judgeCandidates);
 if (judgeInputCapped) {
-  judgeNotes.push(`评审长输入超过上限,只送入 ${judgeInput.length}/${checked.length} 条;其余按复核顺序参与汇总`);
-}
-if (rankedKeys.length > 0) {
-  // Only findings never sent to the judge are appended back. A key that was
-  // sent but not returned is the judge's deliberate merge, not lost work.
-  const unsent = checked.filter(
-    (finding) => !judgeInputKeys.has(finding.key) && !seenJudgeKeys.has(finding.key),
+  judgeNotes.unshift(
+    `评审长输入超过上限,只送入 ${judgeInput.length}/${checked.length} 条;其余按复核顺序参与汇总`,
   );
-  ranked = rankedKeys.concat(unsent);
-  const omitted = judgeInput.length - rankedKeys.length;
-  if (omitted > 0) {
-    judgeNotes.push(`评审长合并/丢弃 ${omitted} 条已复核发现`);
-  }
-  if (unsent.length > 0) {
-    judgeNotes.push(`评审长输入未覆盖 ${unsent.length} 条,按复核顺序追加`);
-  }
-} else if (checked.length > 0) {
-  judgeNotes.push("评审长未返回可解析的 key 列表,按复核顺序输出全部发现");
 }
 
 phase("全局审查:跨批次模式");
 const globalReviewer = agent(
   "全局评审员",
   {
-    system: "你负责跨批次模式审查:同一逻辑在多处重复、各批次对同一概念处理不一致、分层/依赖违规、被批次切碎的关联问题。最多新增 5 条发现,必须带证据;findings.repo 必须填具体仓库名,where 用相对仓库根目录的路径;不要重复已有发现。不要编辑任何文件。",
+    system:
+      `你负责跨批次模式审查:同一逻辑在多处重复、各批次对同一概念处理不一致、分层或依赖违规、被批次切碎的关联问题。最多新增 ${MAX_GLOBAL_FINDINGS} 条发现,必须带证据;每条发现要指向至少两处位置,单个文件内就能看出的问题不属于全局发现;findings.repo 必须填具体仓库名,where 用相对仓库根目录的路径;不要重复已有发现;判断不了写进 notes,不要留空。批次评审员已按规则判据(期望/排除)排除的信号,没有批次当时看不到的新事实就不要重开;确有新事实才可重开,problem 以「重开依据:」开头写明该事实,severity 取 low。不要编辑任何文件。`,
     /* @model:global */
   },
 );
@@ -4805,8 +4972,20 @@ const mapsText =
   mapsTextRaw.length > 6000
     ? `${clip(mapsTextRaw, 6000)}\n…(仓库地图超出总预算,后段已截断)`
     : mapsTextRaw;
+const dismissedNotes = batchCoverage
+  .filter((note) => note.includes("误报判定"))
+  .slice(0, 12)
+  .map((note) => `- ${clip(note, 200)}`)
+  .join("\n");
 const globalResult = await globalReviewer.ask<GlobalReview>(
-  `仓库地图(findings.repo 必须使用这里的仓库名):\n${mapsText}\n\n已复核发现:\n${clip(JSON.stringify(ranked.map((finding) => ({ repo: finding.repo, where: finding.where, problem: finding.problem, evidence: clip(finding.evidence, 200), severity: finding.severity, status: finding.status }))), 4000)}`,
+  `仓库地图(findings.repo 必须使用这里的仓库名):
+${mapsText}
+
+已复核发现:
+${clip(JSON.stringify(ranked.map((finding) => ({ repo: finding.repo, where: finding.where, problem: finding.problem, evidence: clip(finding.evidence, 200), severity: finding.severity, status: finding.status }))), 4000)}
+
+批次已排除的信号(误报判定记录;重开必须给出批次当时看不到的新事实):
+${dismissedNotes || "无"}`,
 );
 
 const globalFindings = Array.isArray(globalResult.findings) ? globalResult.findings : [];
@@ -4814,7 +4993,7 @@ const globalNotes = Array.isArray(globalResult.notes) ? globalResult.notes : [];
 const repoDirByName = new Map(scanResults.map((scan) => [scan.repo.name, scan.repo.dir]));
 const globalCheckedInput: Finding[] = [];
 const globalDropNotes: string[] = [];
-globalFindings.slice(0, 5).forEach((finding, index) => {
+globalFindings.slice(0, MAX_GLOBAL_FINDINGS).forEach((finding, index) => {
   const rawRepo = isRecord(finding) ? finding.repo : undefined;
   const repo = typeof rawRepo === "string" ? rawRepo.trim() : "";
   const dir = repoDirByName.get(repo);
