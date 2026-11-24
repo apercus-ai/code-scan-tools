@@ -2,7 +2,7 @@
 
 ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapReduce 方式实现。核心是**选择器 v2**：规划员写作用于全库的确定性规则（scope/grep/AST/依赖图/工具），脚本在全库确定性执行，只有产生信号的文件才分片复核；规则可持久化、可复用、可审计。**扫描内容按模式选择**：全面扫描、性能、数据库查询、测试覆盖、死代码、代码质量、清理、遥测、无障碍、合规、迁移文档、安全，或自定义目标——与 Devin `/scan` 菜单上的类型一一对应。
 
-> 本仓库为团队内部私有工具仓库。安装后成员可在任意工作区用 `/code-scan` 扫描一个或多个仓库。
+> 公开仓库。安装后可在任意工作区用 `/code-scan` 扫描一个或多个仓库。
 
 ## 它做什么
 
@@ -46,8 +46,8 @@ ZCode 插件：**跨仓库全库扫描**，按 Devin Code Scans 的 Agentic MapR
 
 ## 安装
 
-1. clone 本仓库到本地
-2. ZCode → **Plugin Marketplace → Add → Add Plugin Marketplace** → 粘贴本仓库根目录（含 `marketplace.json`）
+1. clone 本仓库到本地（也可直接填仓库地址，见第 2 步）
+2. ZCode → **Plugin Marketplace → Add → Add Plugin Marketplace** → 粘贴本仓库根目录（含 `marketplace.json`），或填 `https://github.com/apercus-ai/code-scan-tools`
 3. **Personal → dev-code-scan → code-scan → Install**
 4. 在 composer 选择 `code-scan` 插件/skill，或用 `/code-scan` 命令
 
